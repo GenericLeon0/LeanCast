@@ -1,5 +1,16 @@
 node_modules/
 dist/
 release/
+build-native/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+_CPack_Packages/
 *.log
+*.user
+*.suo
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
 .DS_Store

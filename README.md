@@ -1,64 +1,69 @@
 # LeanCast
 
-A lightweight app launcher for Windows. A global shortcut opens a centered search overlay that lets you find and launch installed programs in an instant — with real application icons and keyboard-first navigation.
+LeanCast is a lightweight native Windows app launcher. A global shortcut opens a centered search overlay for installed apps and open windows, with real icons, fuzzy search, keyboard-first navigation, and a tray icon.
 
 ![LeanCast Icon](build/icon.png)
 
 ## Features
 
-- 🔍 **App search** – scans the Windows Start Menu (system-wide and per-user) for installed programs
-- ⚡ **Fuzzy search** – finds matches even with imprecise input, ranked by relevance
-- 🖼️ **Real icons** – displays each program's actual icon
-- ⌨️ **Keyboard-first** – navigate with ↑/↓, launch with ↵, close with Esc
-- 🎛️ **Configurable shortcut** – default `Alt+Space`, freely customizable in Settings
-- 📌 **Tray icon** – runs in the background in the system tray
+- App search across system and per-user Start Menu shortcuts plus AppsFolder entries
+- Open-window switching with foreground restore for minimized windows
+- Token-aware fuzzy search ranked for launcher usage
+- Lazy shell icon loading with a native PNG icon cache
+- Keyboard-first controls: Up/Down, Enter, Ctrl+Shift+Enter, Esc
+- Configurable global shortcut, default `Alt+Space`
+- Compact mode, Windows accent sync, and custom accent color
+- Background tray menu: Open LeanCast, Settings, Quit
+
+AI chat and AI provider settings were removed in the native remake.
 
 ## Usage
 
 | Action | Key |
 | --- | --- |
-| Open / close overlay | `Alt+Space` (default) |
-| Move selection down / up | `↓` / `↑` |
-| Launch selected app | `↵` Enter |
+| Open / close overlay | `Alt+Space` by default |
+| Move selection | `Up` / `Down` |
+| Launch selected app or focus selected window | `Enter` |
+| Launch selected app as administrator | `Ctrl+Shift+Enter` |
 | Close overlay | `Esc` |
-| Open Settings | Gear ⚙ in the search bar or tray menu |
+| Open Settings | Gear button or tray menu |
 
-The **tray icon** (system tray, possibly hidden behind the `^` overflow) offers a right-click menu: *Open LeanCast*, *Settings*, and *Quit*. A left-click opens the search directly.
-
-### Changing the shortcut
-
-Open Settings → click **"Record new shortcut"** → press the desired key combination (at least one modifier: `Ctrl`/`Alt`/`Shift`) → **Save**. The setting persists across restarts. If a shortcut is already taken, an error is shown and the previous one stays active.
-
-## Installation
-
-Built packages are placed under `release/` after building:
-
-- **`LeanCast Setup 0.1.0.exe`** – installer
-- **`LeanCast 0.1.0.exe`** – portable (no installation required)
+The tray icon runs in the background. Left-click opens search; right-click opens the menu.
 
 ## Development
 
-Prerequisite: [Node.js](https://nodejs.org/) (LTS).
+Prerequisites on Windows:
 
-```bash
-npm install      # install dependencies
-npm run dev      # start Vite + Electron with hot reload
-npm run build    # build renderer (React) to dist/
-npm run dist     # build portable .exe + installer to release/
+- Visual Studio 2022 with Desktop development with C++
+- CMake 3.22 or newer
+- Optional: NSIS if you want the CPack NSIS installer target
+
+```powershell
+cmake -S . -B build-native -G "Visual Studio 17 2022" -A x64
+cmake --build build-native --config Release
+ctest --test-dir build-native -C Release
+cpack --config build-native/CPackConfig.cmake -C Release
 ```
 
-> **Packaging note:** `electron-builder` unpacks its `winCodeSign` package on Windows builds, which contains macOS symlinks. Creating those requires **Developer Mode** or admin rights. Enable it via *Settings → System → For developers → Developer Mode*. The `dist` script disables code signing (`CSC_IDENTITY_AUTO_DISCOVERY=false`) since no certificate is used.
+The executable is produced as `build-native/Release/LeanCast.exe` with Visual Studio generators.
 
-### Regenerating the icon
+## Settings and Cache
 
-The app icon is generated entirely from code (no external assets):
+Runtime data is stored under `%APPDATA%\LeanCast`:
+
+- `settings.json` stores `shortcut`, `recentApps`, `compactMode`, `syncAccentColor`, and `customAccentColor`
+- `icon-cache-native/` stores resolved PNG icons keyed by icon source
+
+Older AI-related fields are ignored and are not written back by the native app.
+
+## Icons
+
+The application icon assets are kept in `build/`. Regenerate them with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/gen-icons.ps1
 ```
 
-Produces `build/icon.ico`, `build/icon.png`, and `build/tray.png`.
-
 ## Tech
 
-Electron (main process) + React/Vite (renderer). App discovery via the Windows Start Menu, shortcut resolution via `shell.readShortcutLink`, icons via `app.getFileIcon`. Secure IPC via `contextBridge` (no `nodeIntegration` in the renderer).
+LeanCast is now a Win32 C++23 application rendered with Direct2D/DirectWrite. It uses native Windows APIs for tray integration, shell/app discovery, shortcut parsing, low-level keyboard hooks, window enumeration/focus, and shell icon extraction.
