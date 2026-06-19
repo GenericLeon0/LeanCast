@@ -40,6 +40,7 @@ target_link_libraries(LeanCast PRIVATE
   propsys
   dwmapi
   comctl32
+  advapi32
 )
 
 if(MSVC)
@@ -56,13 +57,18 @@ target_include_directories(LeanCastCoreTests PRIVATE native/src)
 enable_testing()
 add_test(NAME LeanCastCoreTests COMMAND LeanCastCoreTests)
 
-install(TARGETS LeanCast RUNTIME DESTINATION .)
+install(TARGETS LeanCast RUNTIME DESTINATION bin)
 
 set(CPACK_PACKAGE_NAME "LeanCast")
-set(CPACK_PACKAGE_VENDOR "Kurt")
+set(CPACK_PACKAGE_VENDOR "Leon")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_GENERATOR "ZIP;NSIS")
 set(CPACK_NSIS_DISPLAY_NAME "LeanCast")
 set(CPACK_NSIS_PACKAGE_NAME "LeanCast")
 set(CPACK_PACKAGE_EXECUTABLES "LeanCast" "LeanCast")
+set(CPACK_NSIS_MUI_ICON "${LEANCAST_ICON}")
+set(CPACK_NSIS_MUI_UNIICON "${LEANCAST_ICON}")
+set(CPACK_NSIS_MUI_FINISHPAGE_RUN "bin/LeanCast.exe")
+set(CPACK_NSIS_EXTRA_DEFINES "!define MUI_FINISHPAGE_RUN_PARAMETERS \\\"--show\\\"")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 include(CPack)

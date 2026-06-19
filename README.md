@@ -67,3 +67,7 @@ powershell -ExecutionPolicy Bypass -File scripts/gen-icons.ps1
 ## Tech
 
 LeanCast is now a Win32 C++23 application rendered with Direct2D/DirectWrite. It uses native Windows APIs for tray integration, shell/app discovery, shortcut parsing, low-level keyboard hooks, window enumeration/focus, and shell icon extraction.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

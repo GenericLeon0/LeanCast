@@ -14,3 +14,7 @@ _CPack_Packages/
 *.vcxproj.filters
 *.vcxproj.user
 .DS_Store
+
+# Build artifacts
+LeanCast-*.zip
+LeanCast-*.exe

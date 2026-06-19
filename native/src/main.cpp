@@ -1,6 +1,7 @@
 #include "core.hpp"
 
 #include <windows.h>
+#include <cmath>
 #include <windowsx.h>
 #include <commdlg.h>
 #include <d2d1.h>
@@ -68,6 +69,7 @@ enum class HitType {
   CompactToggle,
   AccentToggle,
   AccentColor,
+  StartupToggle,
 };
 
 struct RectF {
@@ -89,6 +91,7 @@ struct Settings {
   bool compactMode = false;
   bool syncAccentColor = true;
   std::wstring customAccentColor = L"#5b6cff";
+  bool startOnStartup = false;
 };
 
 struct ShortcutSpec {
@@ -405,6 +408,35 @@ std::filesystem::path SettingsPath() {
   return UserDataPath() / L"settings.json";
 }
 
+void SetStartOnStartup(bool enable) {
+  HKEY hKey = nullptr;
+  LSTATUS status = RegOpenKeyExW(
+      HKEY_CURRENT_USER,
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+      0,
+      KEY_WRITE,
+      &hKey
+  );
+  if (status == ERROR_SUCCESS) {
+    if (enable) {
+      wchar_t exePath[MAX_PATH];
+      GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+      std::wstring pathStr = L"\"" + std::wstring(exePath) + L"\"";
+      RegSetValueExW(
+          hKey,
+          L"LeanCast",
+          0,
+          REG_SZ,
+          reinterpret_cast<const BYTE*>(pathStr.c_str()),
+          static_cast<DWORD>((pathStr.length() + 1) * sizeof(wchar_t))
+      );
+    } else {
+      RegDeleteValueW(hKey, L"LeanCast");
+    }
+    RegCloseKey(hKey);
+  }
+}
+
 Settings LoadSettings() {
   Settings settings;
   std::ifstream file(SettingsPath(), std::ios::binary);
@@ -417,6 +449,7 @@ Settings LoadSettings() {
   settings.compactMode = JsonBool(json, "compactMode", settings.compactMode);
   settings.syncAccentColor = JsonBool(json, "syncAccentColor", settings.syncAccentColor);
   if (auto custom = JsonString(json, "customAccentColor")) settings.customAccentColor = Utf8ToWide(*custom);
+  settings.startOnStartup = JsonBool(json, "startOnStartup", settings.startOnStartup);
   return settings;
 }
 
@@ -433,7 +466,8 @@ void SaveSettings(const Settings& settings) {
   file << "],\n";
   file << "  \"compactMode\": " << (settings.compactMode ? "true" : "false") << ",\n";
   file << "  \"syncAccentColor\": " << (settings.syncAccentColor ? "true" : "false") << ",\n";
-  file << "  \"customAccentColor\": \"" << JsonEscape(settings.customAccentColor) << "\"\n";
+  file << "  \"customAccentColor\": \"" << JsonEscape(settings.customAccentColor) << "\",\n";
+  file << "  \"startOnStartup\": " << (settings.startOnStartup ? "true" : "false") << "\n";
   file << "}\n";
 }
 
@@ -771,9 +805,11 @@ LeanCastApp* g_app = nullptr;
 
 class LeanCastApp {
  public:
-  explicit LeanCastApp(HINSTANCE instance) : instance_(instance) {
+  explicit LeanCastApp(HINSTANCE instance, std::wstring cmdLine)
+      : instance_(instance), cmdLine_(std::move(cmdLine)) {
     settings_ = LoadSettings();
     shortcut_ = ParseShortcut(settings_.shortcut);
+    SetStartOnStartup(settings_.startOnStartup);
   }
 
   ~LeanCastApp() {
@@ -791,6 +827,10 @@ class LeanCastApp {
     CreateTray();
     InstallHook();
     StartAppDiscovery();
+
+    if (cmdLine_.find(L"--show") != std::wstring::npos) {
+      ShowOverlay(View::Search);
+    }
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -826,7 +866,13 @@ class LeanCastApp {
         if (matches) {
           singleModifierDown_ = true;
           otherKeyWhileSingleModifier_ = false;
-          return shortcut_.singleModifierVk == VK_LWIN ? 1 : CallNextHookEx(hook_, nCode, wParam, lParam);
+          if (shortcut_.singleModifierVk == VK_LWIN) {
+            // Send dummy key to prevent Windows Start Menu from showing on release
+            keybd_event(0xE8, 0, 0, 0);
+            keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+            return 1;
+          }
+          return CallNextHookEx(hook_, nCode, wParam, lParam);
         }
         if (singleModifierDown_) otherKeyWhileSingleModifier_ = true;
       } else if (up && matches) {
@@ -874,6 +920,20 @@ class LeanCastApp {
 
   LRESULT WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+      case WM_TIMER:
+        if (wParam == 1) {
+          if (visible_) {
+            if (!suppressHide_) {
+              HWND foreground = GetForegroundWindow();
+              if (foreground && foreground != hwnd_) {
+                HideOverlay(false);
+                return 0;
+              }
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+          }
+        }
+        return 0;
       case WM_CREATE:
         return 0;
       case WM_DESTROY:
@@ -890,6 +950,9 @@ class LeanCastApp {
         return 0;
       case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE && visible_ && !suppressHide_) HideOverlay(false);
+        return 0;
+      case WM_KILLFOCUS:
+        if (visible_ && !suppressHide_) HideOverlay(false);
         return 0;
       case WM_SYSCOMMAND:
         if ((wParam & 0xFFF0) == SC_KEYMENU) return 0;
@@ -933,6 +996,7 @@ class LeanCastApp {
   void RegisterWindowClass() {
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
+    wc.style = 0;
     wc.hInstance = instance_;
     wc.lpfnWndProc = StaticWndProc;
     wc.lpszClassName = kWindowClass;
@@ -959,6 +1023,9 @@ class LeanCastApp {
 
     SetWindowPos(hwnd_, HWND_TOPMOST, -32000, -32000, WIN_WIDTH, WIN_HEIGHT, SWP_NOACTIVATE | SWP_HIDEWINDOW);
     ApplyRoundedRegion(WIN_WIDTH, WIN_HEIGHT);
+
+    MARGINS margins = {-1, -1, -1, -1};
+    DwmExtendFrameIntoClientArea(hwnd_, &margins);
   }
 
   void CreateDeviceResources() {
@@ -966,7 +1033,7 @@ class LeanCastApp {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     d2dFactory_->CreateHwndRenderTarget(
-      D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_IGNORE), 96, 96),
+      D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED), 96, 96),
       D2D1::HwndRenderTargetProperties(hwnd_, D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
       renderTarget_.GetAddressOf());
 
@@ -976,6 +1043,10 @@ class LeanCastApp {
     CreateTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL, subFormat_);
     CreateTextFormat(11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, sectionFormat_);
     CreateTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL, footerFormat_);
+    CreateTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL, footerRightFormat_);
+    if (footerRightFormat_) {
+      footerRightFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
     CreateTextFormat(16.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, titleFormat_);
     CreateTextFormat(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, labelFormat_);
     CreateTextFormat(13.0f, DWRITE_FONT_WEIGHT_NORMAL, bodyFormat_);
@@ -1380,8 +1451,8 @@ class LeanCastApp {
 
   void ShowOverlay(View view) {
     view_ = view;
+    HWND foreground = GetForegroundWindow();
     if (!visible_) {
-      HWND foreground = GetForegroundWindow();
       if (foreground && foreground != hwnd_) lastActiveWindow_ = foreground;
     }
     RefreshWindows();
@@ -1392,13 +1463,32 @@ class LeanCastApp {
     PositionWindow();
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-    SetForegroundWindow(hwnd_);
-    SetFocus(hwnd_);
+
+    // Auto-focus overlay
+    keybd_event(0xE8, 0, 0, 0);
+    keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+
+    DWORD foregroundThreadId = GetWindowThreadProcessId(foreground, nullptr);
+    DWORD currentThreadId = GetCurrentThreadId();
+    if (foreground && foreground != hwnd_ && foregroundThreadId != currentThreadId) {
+      AttachThreadInput(foregroundThreadId, currentThreadId, TRUE);
+      SetForegroundWindow(hwnd_);
+      SetActiveWindow(hwnd_);
+      SetFocus(hwnd_);
+      AttachThreadInput(foregroundThreadId, currentThreadId, FALSE);
+    } else {
+      SetForegroundWindow(hwnd_);
+      SetActiveWindow(hwnd_);
+      SetFocus(hwnd_);
+    }
+
+    SetTimer(hwnd_, 1, 200, nullptr);
     visible_ = true;
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
 
   void HideOverlay(bool restoreFocus) {
+    KillTimer(hwnd_, 1);
     visible_ = false;
     ShowWindow(hwnd_, SW_HIDE);
     if (restoreFocus && lastActiveWindow_) {
@@ -1435,7 +1525,7 @@ class LeanCastApp {
   }
 
   int CurrentHeight() const {
-    if (view_ == View::Settings) return WIN_HEIGHT;
+    if (view_ == View::Settings) return 600;
     if (!settings_.compactMode) return WIN_HEIGHT;
     if (Trim(query_).empty()) return COMPACT_BASE_HEIGHT;
     POINT cursor{};
@@ -1460,7 +1550,12 @@ class LeanCastApp {
   }
 
   void ApplyRoundedRegion(int width, int height) {
-    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 16, 16);
+    BOOL compositionEnabled = FALSE;
+    if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled)) && compositionEnabled) {
+      SetWindowRgn(hwnd_, nullptr, TRUE);
+      return;
+    }
+    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 14, 14);
     SetWindowRgn(hwnd_, region, TRUE);
   }
 
@@ -1520,6 +1615,23 @@ class LeanCastApp {
     renderTarget_->DrawLine(D2D1::Point2F(x + 13, y + 13), D2D1::Point2F(x + 19, y + 19), brush.Get(), 2.0f);
   }
 
+  void DrawGearIcon(float cx, float cy, D2D1_COLOR_F color) {
+    auto brush = Brush(color);
+    renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 5.0f, 5.0f), brush.Get(), 2.0f);
+    renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 1.5f, 1.5f), brush.Get(), 1.5f);
+    for (int i = 0; i < 8; ++i) {
+      float angle = i * 3.14159265f / 4.0f;
+      float sinA = std::sin(angle);
+      float cosA = std::cos(angle);
+      renderTarget_->DrawLine(
+        D2D1::Point2F(cx + cosA * 5.0f, cy + sinA * 5.0f),
+        D2D1::Point2F(cx + cosA * 8.0f, cy + sinA * 8.0f),
+        brush.Get(),
+        2.0f
+      );
+    }
+  }
+
   void DrawSearch() {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
@@ -1528,18 +1640,47 @@ class LeanCastApp {
     const COLORREF accent = ActiveAccent();
     const COLORREF bg = RGB(0x1c, 0x1c, 0x20);
 
-    FillRound({0, 0, width, height}, 14, D2D1::ColorF(0.11f, 0.11f, 0.13f, 0.96f));
+    FillRound({0, 0, width, height}, 14, D2D1::ColorF(0.13f, 0.13f, 0.15f, 0.94f));
     StrokeRound({0.5f, 0.5f, width - 0.5f, height - 0.5f}, 14, D2D1::ColorF(1, 1, 1, 0.08f));
 
     DrawSearchIcon(18, 20, D2D1::ColorF(0.60f, 0.60f, 0.64f, 1));
     const std::wstring input = query_.empty() ? L"Search apps or windows..." : query_;
     DrawTextBlock(input, {52, 15, width - 94, 48}, inputFormat_.Get(), query_.empty() ? D2D1::ColorF(0.60f, 0.60f, 0.64f) : D2D1::ColorF(0.95f, 0.95f, 0.96f));
 
+    // Draw blinking caret
+    float caretX = 52.0f;
+    if (!query_.empty()) {
+      ComPtr<IDWriteTextLayout> layout;
+      HRESULT hr = dwriteFactory_->CreateTextLayout(
+          query_.c_str(),
+          static_cast<UINT32>(query_.size()),
+          inputFormat_.Get(),
+          width - 94 - 52,
+          48,
+          layout.GetAddressOf()
+      );
+      if (SUCCEEDED(hr)) {
+        DWRITE_TEXT_METRICS metrics{};
+        layout->GetMetrics(&metrics);
+        caretX = 52.0f + metrics.width;
+      }
+    }
+    const bool showCaret = (GetTickCount() / GetCaretBlinkTime()) % 2 == 0;
+    if (showCaret && view_ == View::Search) {
+      auto caretBrush = Brush(D2DColor(accent));
+      renderTarget_->DrawLine(
+          D2D1::Point2F(caretX, 20.0f),
+          D2D1::Point2F(caretX, 42.0f),
+          caretBrush.Get(),
+          1.5f
+      );
+    }
+
     if (caching_) {
       FillRound({width - 82, 26, width - 74, 34}, 4, D2DColor(accent));
     }
     hits_.push_back({{width - 52, 14, width - 16, 50}, HitType::Gear});
-    DrawTextBlock(L"*", {width - 50, 11, width - 16, 48}, centerFormat_.Get(), D2D1::ColorF(0.72f, 0.72f, 0.76f));
+    DrawGearIcon(width - 34, 32, D2D1::ColorF(0.72f, 0.72f, 0.76f));
 
     if (!settings_.compactMode || !query_.empty()) {
       auto border = Brush(D2D1::ColorF(1, 1, 1, 0.08f));
@@ -1549,7 +1690,7 @@ class LeanCastApp {
     if (settings_.compactMode && query_.empty()) return;
 
     const bool showFooter = !settings_.compactMode;
-    const float footerHeight = showFooter ? 36.0f : 0.0f;
+    const float footerHeight = showFooter ? 40.0f : 0.0f;
     const float resultsTop = 60.0f;
     const float resultsBottom = height - footerHeight;
     const float viewHeight = resultsBottom - resultsTop;
@@ -1558,6 +1699,7 @@ class LeanCastApp {
 
     float y = resultsTop - static_cast<float>(scroll_);
     int rowIndex = 0;
+    renderTarget_->PushAxisAlignedClip(D2D1::RectF(0, resultsTop, width, resultsBottom), D2D1_ANTIALIAS_MODE_ALIASED);
     for (const auto& section : sections_) {
       if (y + 26 >= resultsTop && y <= resultsBottom) {
         DrawTextBlock(section.title, {12, y + 8, width - 12, y + 24}, sectionFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
@@ -1572,16 +1714,17 @@ class LeanCastApp {
         ++rowIndex;
       }
     }
+    renderTarget_->PopAxisAlignedClip();
 
     if (sections_.empty()) {
       DrawTextBlock(appsReady_ ? L"No results" : L"Loading apps...", {0, 170, width, 210}, centerFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
     }
 
     if (showFooter) {
-      auto border = Brush(D2D1::ColorF(1, 1, 1, 0.08f));
-      renderTarget_->DrawLine(D2D1::Point2F(0, height - 36), D2D1::Point2F(width, height - 36), border.Get(), 1);
-      DrawTextBlock(L"LeanCast", {16, height - 27, 160, height - 8}, footerFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
-      DrawTextBlock(L"Up/Down Navigate | Enter Open | Ctrl+Shift+Enter Admin | Esc Close", {250, height - 27, width - 16, height - 8}, footerFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
+      auto border = Brush(D2D1::ColorF(1, 1, 1, 0.06f));
+      renderTarget_->DrawLine(D2D1::Point2F(0, height - 40.0f), D2D1::Point2F(width, height - 40.0f), border.Get(), 1.0f);
+      DrawTextBlock(L"LeanCast", {16, height - 28.0f, 160, height - 12.0f}, footerFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
+      DrawTextBlock(L"Up/Down Navigate | Enter Open | Ctrl+Shift+Enter Admin | Esc Close", {200, height - 28.0f, width - 16.0f, height - 12.0f}, footerRightFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
     }
   }
 
@@ -1629,7 +1772,7 @@ class LeanCastApp {
     const float height = static_cast<float>(rc.bottom - rc.top);
     const COLORREF accent = ActiveAccent();
 
-    FillRound({0, 0, width, height}, 14, D2D1::ColorF(0.11f, 0.11f, 0.13f, 0.96f));
+    FillRound({0, 0, width, height}, 14, D2D1::ColorF(0.13f, 0.13f, 0.15f, 0.94f));
     StrokeRound({0.5f, 0.5f, width - 0.5f, height - 0.5f}, 14, D2D1::ColorF(1, 1, 1, 0.08f));
     hits_.push_back({{10, 10, 46, 46}, HitType::Back});
     DrawTextBlock(L"<", {10, 11, 46, 45}, centerFormat_.Get(), D2D1::ColorF(0.72f, 0.72f, 0.76f));
@@ -1665,18 +1808,25 @@ class LeanCastApp {
     y += 62;
     DrawTextBlock(L"At least one modifier is required. Examples: Alt+Space, Control+Space.", {20, y, width - 20, y + 20}, bodyFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
 
-    y += 50;
+    y += 40;
+    DrawTextBlock(L"Start on Startup", {20, y, width - 20, y + 20}, labelFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
+    y += 22;
+    DrawTextBlock(L"Launch LeanCast automatically when you log into Windows.", {20, y, width - 20, y + 20}, bodyFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
+    y += 28;
+    DrawToggle({20, y, 120, y + 34}, settings_.startOnStartup, settings_.startOnStartup ? L"On" : L"Off", HitType::StartupToggle);
+
+    y += 48;
     DrawTextBlock(L"Compact Mode", {20, y, width - 20, y + 20}, labelFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
-    y += 25;
+    y += 22;
     DrawTextBlock(L"Shows only the search bar at rest; results expand below.", {20, y, width - 20, y + 20}, bodyFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
-    y += 32;
+    y += 28;
     DrawToggle({20, y, 120, y + 34}, settings_.compactMode, settings_.compactMode ? L"On" : L"Off", HitType::CompactToggle);
 
-    y += 62;
+    y += 48;
     DrawTextBlock(L"Accent Color", {20, y, width - 20, y + 20}, labelFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
-    y += 25;
+    y += 22;
     DrawTextBlock(L"Choose between auto-syncing with Windows or selecting a custom color.", {20, y, width - 20, y + 20}, bodyFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
-    y += 32;
+    y += 28;
     DrawToggle({20, y, 210, y + 34}, settings_.syncAccentColor, settings_.syncAccentColor ? L"Sync with Windows" : L"Custom Color", HitType::AccentToggle);
     if (!settings_.syncAccentColor) {
       RectF colorBox{230, y, 320, y + 34};
@@ -1973,6 +2123,12 @@ class LeanCastApp {
           SaveSettings(settings_);
           InvalidateRect(hwnd_, nullptr, FALSE);
           return;
+        case HitType::StartupToggle:
+          settings_.startOnStartup = !settings_.startOnStartup;
+          SetStartOnStartup(settings_.startOnStartup);
+          SaveSettings(settings_);
+          InvalidateRect(hwnd_, nullptr, FALSE);
+          return;
         case HitType::CompactToggle:
           settings_.compactMode = !settings_.compactMode;
           SaveSettings(settings_);
@@ -2095,6 +2251,7 @@ class LeanCastApp {
   }
 
   HINSTANCE instance_ = nullptr;
+  std::wstring cmdLine_;
   HWND hwnd_ = nullptr;
   NOTIFYICONDATAW tray_{};
   HHOOK hook_ = nullptr;
@@ -2136,6 +2293,7 @@ class LeanCastApp {
   ComPtr<IDWriteTextFormat> subFormat_;
   ComPtr<IDWriteTextFormat> sectionFormat_;
   ComPtr<IDWriteTextFormat> footerFormat_;
+  ComPtr<IDWriteTextFormat> footerRightFormat_;
   ComPtr<IDWriteTextFormat> titleFormat_;
   ComPtr<IDWriteTextFormat> labelFormat_;
   ComPtr<IDWriteTextFormat> bodyFormat_;
@@ -2145,7 +2303,7 @@ class LeanCastApp {
 
 }  // namespace
 
-int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
   HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
   if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
     HWND existing = FindWindowW(kWindowClass, L"LeanCast");
@@ -2154,7 +2312,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     return 0;
   }
 
-  LeanCastApp app(instance);
+  std::wstring cmdLineStr = cmdLine ? cmdLine : L"";
+  LeanCastApp app(instance, cmdLineStr);
   const int result = app.Run();
   if (mutex) CloseHandle(mutex);
   return result;

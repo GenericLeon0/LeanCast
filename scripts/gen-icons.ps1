@@ -1,51 +1,33 @@
 # Generates the LeanCast icon (build/icon.ico, build/icon.png, build/tray.png)
-# from pure code – no external assets required.
+# from the checked-in source artwork.
 Add-Type -AssemblyName System.Drawing
 
 $buildDir = Join-Path $PSScriptRoot "..\build"
+$assetPath = Join-Path $PSScriptRoot "..\native\assets\icon.png"
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 
-function New-RoundedPath([int]$w, [int]$h, [int]$r) {
-  $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-  $d = $r * 2
-  $path.AddArc(0, 0, $d, $d, 180, 90)
-  $path.AddArc($w - $d, 0, $d, $d, 270, 90)
-  $path.AddArc($w - $d, $h - $d, $d, $d, 0, 90)
-  $path.AddArc(0, $h - $d, $d, $d, 90, 90)
-  $path.CloseFigure()
-  return $path
+if (-not (Test-Path $assetPath)) {
+  throw "Icon source not found: $assetPath"
 }
 
-function New-LeanBitmap([int]$size) {
+function New-IconBitmap([System.Drawing.Image]$source, [int]$size) {
   $bmp = New-Object System.Drawing.Bitmap($size, $size)
   $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-  $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+  $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+  $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+  $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+  $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+  $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
   $g.Clear([System.Drawing.Color]::Transparent)
-
-  $radius = [int]($size * 0.22)
-  $path = New-RoundedPath $size $size $radius
-
-  $c1 = [System.Drawing.Color]::FromArgb(255, 91, 108, 255)   # Indigo
-  $c2 = [System.Drawing.Color]::FromArgb(255, 124, 58, 237)   # Violet
-  $rect = New-Object System.Drawing.Rectangle(0, 0, $size, $size)
-  $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, $c1, $c2, 45)
-  $g.FillPath($brush, $path)
-
-  $fontSize = [single]($size * 0.58)
-  $font = New-Object System.Drawing.Font("Segoe UI", $fontSize, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
-  $sf = New-Object System.Drawing.StringFormat
-  $sf.Alignment = [System.Drawing.StringAlignment]::Center
-  $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-  $textRect = New-Object System.Drawing.RectangleF(0, [single](-$size*0.04), $size, $size)
-  $g.DrawString("L", $font, [System.Drawing.Brushes]::White, $textRect, $sf)
-
+  $g.DrawImage($source, 0, 0, $size, $size)
   $g.Dispose()
   return $bmp
 }
 
+$source = [System.Drawing.Image]::FromFile((Resolve-Path $assetPath))
+
 # 256px PNG (for ICO and window icon)
-$big = New-LeanBitmap 256
+$big = New-IconBitmap $source 256
 $pngPath = Join-Path $buildDir "icon.png"
 $big.Save($pngPath, [System.Drawing.Imaging.ImageFormat]::Png)
 
@@ -74,9 +56,9 @@ $bw.Write($pngBytes)
 $bw.Flush(); $bw.Dispose(); $fs.Dispose()
 
 # 32px tray PNG
-$tray = New-LeanBitmap 32
+$tray = New-IconBitmap $source 32
 $trayPath = Join-Path $buildDir "tray.png"
 $tray.Save($trayPath, [System.Drawing.Imaging.ImageFormat]::Png)
 
-$big.Dispose(); $tray.Dispose()
+$big.Dispose(); $tray.Dispose(); $source.Dispose()
 Write-Host "Icons generated in $buildDir : icon.ico, icon.png, tray.png"
