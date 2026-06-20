@@ -1,4 +1,6 @@
+#include "calculator.hpp"
 #include "core.hpp"
+#include "shortcut.hpp"
 
 #include <windows.h>
 #include <cmath>
@@ -19,6 +21,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -31,6 +38,15 @@
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
+using leancast::shortcut::CurrentPressedModifiers;
+using leancast::shortcut::FormatShortcut;
+using leancast::shortcut::GenericModifier;
+using leancast::shortcut::IsModifier;
+using leancast::shortcut::KeyName;
+using leancast::shortcut::ModifierPressed;
+using leancast::shortcut::ParseShortcut;
+using leancast::shortcut::ShortcutRuntime;
+using leancast::shortcut::ShortcutSpec;
 
 namespace {
 
@@ -47,6 +63,10 @@ constexpr int WIN_HEIGHT = 470;
 constexpr int COMPACT_BASE_HEIGHT = 60;
 constexpr int RECENT_LIMIT = 8;
 constexpr int MAX_RESULTS = 200;
+constexpr int MIN_OVERLAY_WIDTH = 560;
+constexpr int MAX_OVERLAY_WIDTH = 980;
+constexpr int MIN_RESULTS = 25;
+constexpr int MAX_RESULT_SETTING = 400;
 
 enum class View {
   Search,
@@ -70,6 +90,40 @@ enum class HitType {
   AccentToggle,
   AccentColor,
   StartupToggle,
+  ShowWindowsToggle,
+  ShowStoreAppsToggle,
+  ClearRecents,
+  ClearIconCache,
+  OverlayWidthDown,
+  OverlayWidthUp,
+  MaxResultsDown,
+  MaxResultsUp,
+};
+
+enum class CommandKind {
+  Settings,
+  Quit,
+  Restart,
+  RefreshApps,
+  ClearIconCache,
+  ClearRecents,
+  OpenDataFolder,
+};
+
+enum class ActionKind {
+  None,
+  Open,
+  RunAsAdmin,
+  OpenLocation,
+  CopyPath,
+  Pin,
+  Unpin,
+  Hide,
+  Unhide,
+  Switch,
+  Minimize,
+  MaximizeRestore,
+  CloseWindow,
 };
 
 struct RectF {
@@ -88,22 +142,22 @@ struct HitTarget {
 struct Settings {
   std::wstring shortcut = L"Alt+Space";
   std::vector<std::wstring> recentApps;
+  std::vector<std::wstring> pinnedApps;
+  std::vector<std::wstring> hiddenApps;
+  std::map<std::wstring, std::wstring> appAliases;
+  struct UsageStat {
+    int launches = 0;
+    long long lastUsed = 0;
+  };
+  std::map<std::wstring, UsageStat> usageStats;
   bool compactMode = false;
   bool syncAccentColor = true;
   std::wstring customAccentColor = L"#5b6cff";
   bool startOnStartup = false;
-};
-
-struct ShortcutSpec {
-  bool ctrl = false;
-  bool alt = false;
-  bool shift = false;
-  bool win = false;
-  UINT vk = 0;
-  bool singleModifier = false;
-  UINT singleModifierVk = 0;
-  bool valid = false;
-  std::wstring display;
+  int overlayWidth = WIN_WIDTH;
+  int maxResults = MAX_RESULTS;
+  bool showOpenWindows = true;
+  bool showStoreApps = true;
 };
 
 struct ShortcutInfo {
@@ -142,19 +196,44 @@ struct WindowEntry {
 
 struct DisplayItem {
   bool isWindow = false;
+  bool isCommand = false;
+  bool isAction = false;
+  bool isCalculator = false;
   AppEntry app;
   WindowEntry window;
+  CommandKind command = CommandKind::Settings;
+  ActionKind action = ActionKind::None;
+  bool actionTargetIsWindow = false;
+  AppEntry actionApp;
+  WindowEntry actionWindow;
+  std::wstring commandName;
+  std::wstring commandDetail;
+  std::vector<std::wstring> commandKeywords;
+  std::wstring calculationExpression;
+  std::wstring calculationResult;
 
   std::wstring Key() const {
+    if (isCalculator) return L"calc:" + calculationExpression;
+    if (isCommand) return L"cmd:" + std::to_wstring(static_cast<int>(command));
+    if (isAction) return L"act:" + std::to_wstring(static_cast<int>(action)) + L":" +
+                         (actionTargetIsWindow ? std::to_wstring(reinterpret_cast<uintptr_t>(actionWindow.hwnd))
+                                               : (!actionApp.id.empty() ? actionApp.id : actionApp.path));
     if (isWindow) return L"win:" + std::to_wstring(reinterpret_cast<uintptr_t>(window.hwnd));
     return !app.id.empty() ? app.id : app.path;
   }
 
   std::wstring Name() const {
+    if (isCalculator) return calculationResult;
+    if (isCommand) return commandName;
+    if (isAction) return commandName;
     return isWindow ? window.name : app.name;
   }
 
   std::wstring IconKey() const {
+    if (isCalculator) return L"";
+    if (isAction) return actionTargetIsWindow ? (!actionWindow.iconKey.empty() ? actionWindow.iconKey : actionWindow.exe)
+                                              : (!actionApp.iconKey.empty() ? actionApp.iconKey : actionApp.path);
+    if (isCommand) return L"";
     return isWindow ? (!window.iconKey.empty() ? window.iconKey : window.exe)
                     : (!app.iconKey.empty() ? app.iconKey : app.path);
   }
@@ -279,6 +358,93 @@ bool IsSystemEssentialName(const std::wstring& name) {
   return names.contains(NameKey(name));
 }
 
+long long UnixNow() {
+  return static_cast<long long>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+}
+
+std::wstring PrimaryAppId(const AppEntry& app) {
+  if (!app.id.empty()) return app.id;
+  if (!app.path.empty()) return app.path;
+  return app.launchTarget;
+}
+
+std::vector<std::wstring> AppKeys(const AppEntry& app) {
+  std::vector<std::wstring> keys;
+  auto add = [&](const std::wstring& key) {
+    if (!key.empty() && std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+  };
+  add(app.id);
+  add(app.path);
+  add(app.launchTarget);
+  add(app.targetPath);
+  return keys;
+}
+
+bool ContainsValue(const std::vector<std::wstring>& values, const std::wstring& value) {
+  return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+bool ContainsAnyAppKey(const std::vector<std::wstring>& values, const AppEntry& app) {
+  for (const auto& key : AppKeys(app)) {
+    if (ContainsValue(values, key)) return true;
+  }
+  return false;
+}
+
+void RemoveValue(std::vector<std::wstring>& values, const std::wstring& value) {
+  values.erase(std::remove(values.begin(), values.end(), value), values.end());
+}
+
+bool IsStoreLikeSource(const std::wstring& source) {
+  return source == L"appx" || source == L"start" || source == L"alias";
+}
+
+DisplayItem AppDisplay(const AppEntry& app) {
+  DisplayItem item;
+  item.app = app;
+  return item;
+}
+
+DisplayItem WindowDisplay(const WindowEntry& window) {
+  DisplayItem item;
+  item.isWindow = true;
+  item.window = window;
+  return item;
+}
+
+DisplayItem CommandDisplay(CommandKind command, std::wstring name, std::wstring detail, std::vector<std::wstring> keywords) {
+  DisplayItem item;
+  item.isCommand = true;
+  item.command = command;
+  item.commandName = std::move(name);
+  item.commandDetail = std::move(detail);
+  item.commandKeywords = std::move(keywords);
+  return item;
+}
+
+DisplayItem ActionDisplay(ActionKind action, std::wstring name, std::wstring detail, const DisplayItem& target) {
+  DisplayItem item;
+  item.isAction = true;
+  item.action = action;
+  item.commandKeywords = {name, detail};
+  item.commandName = std::move(name);
+  item.commandDetail = std::move(detail);
+  item.actionTargetIsWindow = target.isWindow;
+  item.actionApp = target.app;
+  item.actionWindow = target.window;
+  return item;
+}
+
+DisplayItem CalculatorDisplay(const leancast::calculator::Result& result) {
+  DisplayItem item;
+  item.isCalculator = true;
+  item.calculationExpression = result.expression;
+  item.calculationResult = result.display;
+  item.commandDetail = L"Calculator result - " + result.expression;
+  item.commandKeywords = {L"calculator", L"calc", result.expression, result.display};
+  return item;
+}
+
 bool PointInRect(const RectF& rect, float x, float y) {
   return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
 }
@@ -352,6 +518,34 @@ bool JsonBool(const std::string& json, const std::string& key, bool fallback) {
   return fallback;
 }
 
+int JsonInt(const std::string& json, const std::string& key, int fallback) {
+  const std::string marker = "\"" + key + "\"";
+  size_t pos = json.find(marker);
+  if (pos == std::string::npos) return fallback;
+  pos = json.find(':', pos);
+  if (pos == std::string::npos) return fallback;
+  const size_t value = json.find_first_not_of(" \t\r\n", pos + 1);
+  if (value == std::string::npos) return fallback;
+  char* end = nullptr;
+  const long parsed = std::strtol(json.c_str() + value, &end, 10);
+  if (end == json.c_str() + value) return fallback;
+  return static_cast<int>(parsed);
+}
+
+long long JsonLongLong(const std::string& json, const std::string& key, long long fallback) {
+  const std::string marker = "\"" + key + "\"";
+  size_t pos = json.find(marker);
+  if (pos == std::string::npos) return fallback;
+  pos = json.find(':', pos);
+  if (pos == std::string::npos) return fallback;
+  const size_t value = json.find_first_not_of(" \t\r\n", pos + 1);
+  if (value == std::string::npos) return fallback;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(json.c_str() + value, &end, 10);
+  if (end == json.c_str() + value) return fallback;
+  return parsed;
+}
+
 std::vector<std::wstring> JsonStringArray(const std::string& json, const std::string& key) {
   std::vector<std::wstring> out;
   const std::string marker = "\"" + key + "\"";
@@ -388,6 +582,118 @@ std::vector<std::wstring> JsonStringArray(const std::string& json, const std::st
   return out;
 }
 
+std::optional<std::string> JsonObjectSlice(const std::string& json, const std::string& key) {
+  const std::string marker = "\"" + key + "\"";
+  size_t pos = json.find(marker);
+  if (pos == std::string::npos) return std::nullopt;
+  pos = json.find('{', pos);
+  if (pos == std::string::npos) return std::nullopt;
+
+  int depth = 0;
+  bool inString = false;
+  bool escaped = false;
+  for (size_t i = pos; i < json.size(); ++i) {
+    const char ch = json[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch == '\\') escaped = true;
+      else if (ch == '"') inString = false;
+      continue;
+    }
+    if (ch == '"') {
+      inString = true;
+    } else if (ch == '{') {
+      ++depth;
+    } else if (ch == '}') {
+      --depth;
+      if (depth == 0) return json.substr(pos, i - pos + 1);
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> ReadJsonString(const std::string& text, size_t& cursor) {
+  cursor = text.find('"', cursor);
+  if (cursor == std::string::npos) return std::nullopt;
+  ++cursor;
+  std::string value;
+  bool escaped = false;
+  for (; cursor < text.size(); ++cursor) {
+    const char ch = text[cursor];
+    if (escaped) {
+      if (ch == 'n') value.push_back('\n');
+      else value.push_back(ch);
+      escaped = false;
+    } else if (ch == '\\') {
+      escaped = true;
+    } else if (ch == '"') {
+      ++cursor;
+      return value;
+    } else {
+      value.push_back(ch);
+    }
+  }
+  return std::nullopt;
+}
+
+std::map<std::wstring, std::wstring> JsonStringObject(const std::string& json, const std::string& key) {
+  std::map<std::wstring, std::wstring> out;
+  const auto slice = JsonObjectSlice(json, key);
+  if (!slice) return out;
+
+  size_t cursor = 1;
+  while (cursor < slice->size()) {
+    auto rawKey = ReadJsonString(*slice, cursor);
+    if (!rawKey) break;
+    cursor = slice->find(':', cursor);
+    if (cursor == std::string::npos) break;
+    ++cursor;
+    auto rawValue = ReadJsonString(*slice, cursor);
+    if (!rawValue) break;
+    out[Utf8ToWide(*rawKey)] = Utf8ToWide(*rawValue);
+    cursor = slice->find(',', cursor);
+    if (cursor == std::string::npos) break;
+    ++cursor;
+  }
+  return out;
+}
+
+std::map<std::wstring, Settings::UsageStat> JsonUsageStats(const std::string& json, const std::string& key) {
+  std::map<std::wstring, Settings::UsageStat> out;
+  const auto slice = JsonObjectSlice(json, key);
+  if (!slice) return out;
+
+  size_t cursor = 1;
+  while (cursor < slice->size()) {
+    auto rawKey = ReadJsonString(*slice, cursor);
+    if (!rawKey) break;
+    const size_t valueStart = slice->find('{', cursor);
+    if (valueStart == std::string::npos) break;
+    int depth = 0;
+    size_t valueEnd = std::string::npos;
+    for (size_t i = valueStart; i < slice->size(); ++i) {
+      if ((*slice)[i] == '{') ++depth;
+      else if ((*slice)[i] == '}') {
+        --depth;
+        if (depth == 0) {
+          valueEnd = i;
+          break;
+        }
+      }
+    }
+    if (valueEnd == std::string::npos) break;
+    const std::string statJson = slice->substr(valueStart, valueEnd - valueStart + 1);
+    out[Utf8ToWide(*rawKey)] = {
+      JsonInt(statJson, "launches", 0),
+      JsonLongLong(statJson, "lastUsed", 0),
+    };
+    cursor = slice->find(',', valueEnd);
+    if (cursor == std::string::npos) break;
+    ++cursor;
+  }
+  return out;
+}
+
 std::string JsonEscape(const std::wstring& value) {
   std::string in = WideToUtf8(value);
   std::string out;
@@ -402,6 +708,38 @@ std::string JsonEscape(const std::wstring& value) {
     }
   }
   return out;
+}
+
+void WriteStringArray(std::ofstream& file, const std::vector<std::wstring>& values) {
+  file << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i) file << ", ";
+    file << "\"" << JsonEscape(values[i]) << "\"";
+  }
+  file << "]";
+}
+
+void WriteStringObject(std::ofstream& file, const std::map<std::wstring, std::wstring>& values) {
+  file << "{";
+  bool first = true;
+  for (const auto& [key, value] : values) {
+    if (!first) file << ", ";
+    first = false;
+    file << "\"" << JsonEscape(key) << "\": \"" << JsonEscape(value) << "\"";
+  }
+  file << "}";
+}
+
+void WriteUsageStats(std::ofstream& file, const std::map<std::wstring, Settings::UsageStat>& values) {
+  file << "{";
+  bool first = true;
+  for (const auto& [key, stat] : values) {
+    if (!first) file << ", ";
+    first = false;
+    file << "\"" << JsonEscape(key) << "\": {\"launches\": " << stat.launches
+         << ", \"lastUsed\": " << stat.lastUsed << "}";
+  }
+  file << "}";
 }
 
 std::filesystem::path SettingsPath() {
@@ -446,201 +784,60 @@ Settings LoadSettings() {
   const std::string json = buffer.str();
   if (auto shortcut = JsonString(json, "shortcut")) settings.shortcut = Utf8ToWide(*shortcut);
   settings.recentApps = JsonStringArray(json, "recentApps");
+  settings.pinnedApps = JsonStringArray(json, "pinnedApps");
+  settings.hiddenApps = JsonStringArray(json, "hiddenApps");
+  settings.appAliases = JsonStringObject(json, "appAliases");
+  settings.usageStats = JsonUsageStats(json, "usageStats");
   settings.compactMode = JsonBool(json, "compactMode", settings.compactMode);
   settings.syncAccentColor = JsonBool(json, "syncAccentColor", settings.syncAccentColor);
   if (auto custom = JsonString(json, "customAccentColor")) settings.customAccentColor = Utf8ToWide(*custom);
   settings.startOnStartup = JsonBool(json, "startOnStartup", settings.startOnStartup);
+  settings.overlayWidth = std::clamp(JsonInt(json, "overlayWidth", settings.overlayWidth), MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
+  settings.maxResults = std::clamp(JsonInt(json, "maxResults", settings.maxResults), MIN_RESULTS, MAX_RESULT_SETTING);
+  settings.showOpenWindows = JsonBool(json, "showOpenWindows", settings.showOpenWindows);
+  settings.showStoreApps = JsonBool(json, "showStoreApps", settings.showStoreApps);
   return settings;
 }
 
 void SaveSettings(const Settings& settings) {
-  std::ofstream file(SettingsPath(), std::ios::binary | std::ios::trunc);
+  const auto path = SettingsPath();
+  auto temp = path;
+  temp += L".tmp";
+  std::ofstream file(temp, std::ios::binary | std::ios::trunc);
   if (!file) return;
   file << "{\n";
   file << "  \"shortcut\": \"" << JsonEscape(settings.shortcut) << "\",\n";
-  file << "  \"recentApps\": [";
-  for (size_t i = 0; i < settings.recentApps.size(); ++i) {
-    if (i) file << ", ";
-    file << "\"" << JsonEscape(settings.recentApps[i]) << "\"";
-  }
-  file << "],\n";
+  file << "  \"recentApps\": ";
+  WriteStringArray(file, settings.recentApps);
+  file << ",\n";
+  file << "  \"pinnedApps\": ";
+  WriteStringArray(file, settings.pinnedApps);
+  file << ",\n";
+  file << "  \"hiddenApps\": ";
+  WriteStringArray(file, settings.hiddenApps);
+  file << ",\n";
+  file << "  \"appAliases\": ";
+  WriteStringObject(file, settings.appAliases);
+  file << ",\n";
+  file << "  \"usageStats\": ";
+  WriteUsageStats(file, settings.usageStats);
+  file << ",\n";
   file << "  \"compactMode\": " << (settings.compactMode ? "true" : "false") << ",\n";
   file << "  \"syncAccentColor\": " << (settings.syncAccentColor ? "true" : "false") << ",\n";
   file << "  \"customAccentColor\": \"" << JsonEscape(settings.customAccentColor) << "\",\n";
-  file << "  \"startOnStartup\": " << (settings.startOnStartup ? "true" : "false") << "\n";
+  file << "  \"startOnStartup\": " << (settings.startOnStartup ? "true" : "false") << ",\n";
+  file << "  \"overlayWidth\": " << std::clamp(settings.overlayWidth, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH) << ",\n";
+  file << "  \"maxResults\": " << std::clamp(settings.maxResults, MIN_RESULTS, MAX_RESULT_SETTING) << ",\n";
+  file << "  \"showOpenWindows\": " << (settings.showOpenWindows ? "true" : "false") << ",\n";
+  file << "  \"showStoreApps\": " << (settings.showStoreApps ? "true" : "false") << "\n";
   file << "}\n";
-}
+  file.close();
 
-UINT VkFromName(std::wstring name) {
-  name = Lower(Trim(std::move(name)));
-  if (name == L"space") return VK_SPACE;
-  if (name == L"return" || name == L"enter") return VK_RETURN;
-  if (name == L"tab") return VK_TAB;
-  if (name == L"up") return VK_UP;
-  if (name == L"down") return VK_DOWN;
-  if (name == L"left") return VK_LEFT;
-  if (name == L"right") return VK_RIGHT;
-  if (name == L"home") return VK_HOME;
-  if (name == L"end") return VK_END;
-  if (name == L"pageup") return VK_PRIOR;
-  if (name == L"pagedown") return VK_NEXT;
-  if (name == L"insert") return VK_INSERT;
-  if (name == L"delete") return VK_DELETE;
-  if (name == L"backspace") return VK_BACK;
-  if (name == L"escape" || name == L"esc") return VK_ESCAPE;
-  if (name == L"plus") return VK_OEM_PLUS;
-  if (name == L"-") return VK_OEM_MINUS;
-  if (name == L",") return VK_OEM_COMMA;
-  if (name == L".") return VK_OEM_PERIOD;
-  if (name == L"/") return VK_OEM_2;
-  if (name.size() == 1) {
-    const wchar_t ch = name[0];
-    if (ch >= L'a' && ch <= L'z') return static_cast<UINT>(L'A' + ch - L'a');
-    if (ch >= L'0' && ch <= L'9') return static_cast<UINT>(ch);
+  if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::rename(temp, path, ec);
   }
-  if (name.size() >= 2 && name[0] == L'f') {
-    const int n = _wtoi(name.c_str() + 1);
-    if (n >= 1 && n <= 12) return VK_F1 + n - 1;
-  }
-  return 0;
-}
-
-std::wstring KeyName(UINT vk) {
-  if (vk >= L'A' && vk <= L'Z') return std::wstring(1, static_cast<wchar_t>(vk));
-  if (vk >= L'0' && vk <= L'9') return std::wstring(1, static_cast<wchar_t>(vk));
-  if (vk >= VK_F1 && vk <= VK_F12) return L"F" + std::to_wstring(vk - VK_F1 + 1);
-  switch (vk) {
-    case VK_SPACE: return L"Space";
-    case VK_RETURN: return L"Return";
-    case VK_TAB: return L"Tab";
-    case VK_UP: return L"Up";
-    case VK_DOWN: return L"Down";
-    case VK_LEFT: return L"Left";
-    case VK_RIGHT: return L"Right";
-    case VK_HOME: return L"Home";
-    case VK_END: return L"End";
-    case VK_PRIOR: return L"PageUp";
-    case VK_NEXT: return L"PageDown";
-    case VK_INSERT: return L"Insert";
-    case VK_DELETE: return L"Delete";
-    case VK_BACK: return L"Backspace";
-    case VK_ESCAPE: return L"Escape";
-    case VK_OEM_PLUS: return L"Plus";
-    case VK_OEM_MINUS: return L"-";
-    case VK_OEM_COMMA: return L",";
-    case VK_OEM_PERIOD: return L".";
-    case VK_OEM_2: return L"/";
-    default: return L"";
-  }
-}
-
-bool IsModifier(UINT vk) {
-  return vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
-         vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
-         vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
-         vk == VK_LWIN || vk == VK_RWIN;
-}
-
-std::wstring ModifierName(UINT vk) {
-  if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) return L"Control";
-  if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) return L"Alt";
-  if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) return L"Shift";
-  if (vk == VK_LWIN || vk == VK_RWIN) return L"Super";
-  return L"";
-}
-
-UINT GenericModifier(UINT vk) {
-  if (vk == VK_LCONTROL || vk == VK_RCONTROL) return VK_CONTROL;
-  if (vk == VK_LMENU || vk == VK_RMENU) return VK_MENU;
-  if (vk == VK_LSHIFT || vk == VK_RSHIFT) return VK_SHIFT;
-  if (vk == VK_RWIN) return VK_LWIN;
-  return vk;
-}
-
-bool ModifierPressed(UINT vk) {
-  if (vk == VK_CONTROL) return (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-  if (vk == VK_MENU) return (GetAsyncKeyState(VK_MENU) & 0x8000) || (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
-  if (vk == VK_SHIFT) return (GetAsyncKeyState(VK_SHIFT) & 0x8000) || (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-  if (vk == VK_LWIN) return (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
-  return false;
-}
-
-std::wstring FormatShortcut(bool ctrl, bool alt, bool shift, bool win, UINT vk, bool singleModifier = false, UINT singleModifierVk = 0) {
-  if (singleModifier) return ModifierName(singleModifierVk);
-  std::vector<std::wstring> parts;
-  if (ctrl) parts.push_back(L"Control");
-  if (alt) parts.push_back(L"Alt");
-  if (shift) parts.push_back(L"Shift");
-  if (win) parts.push_back(L"Super");
-  const auto key = KeyName(vk);
-  if (!key.empty()) parts.push_back(key);
-  std::wstring out;
-  for (size_t i = 0; i < parts.size(); ++i) {
-    if (i) out += L"+";
-    out += parts[i];
-  }
-  return out;
-}
-
-ShortcutSpec ParseShortcut(const std::wstring& input) {
-  ShortcutSpec spec;
-  const std::wstring raw = Trim(input);
-  if (raw.empty() || Lower(raw) == L"none") {
-    spec.display = L"none";
-    return spec;
-  }
-
-  std::vector<std::wstring> parts;
-  std::wstring current;
-  for (const wchar_t ch : raw) {
-    if (ch == L'+') {
-      parts.push_back(Trim(current));
-      current.clear();
-    } else {
-      current.push_back(ch);
-    }
-  }
-  if (!current.empty()) parts.push_back(Trim(current));
-
-  if (parts.size() == 1) {
-    const std::wstring lower = Lower(parts[0]);
-    UINT mod = 0;
-    if (lower == L"control" || lower == L"ctrl") mod = VK_CONTROL;
-    else if (lower == L"alt") mod = VK_MENU;
-    else if (lower == L"shift") mod = VK_SHIFT;
-    else if (lower == L"super" || lower == L"win") mod = VK_LWIN;
-    if (mod) {
-      spec.singleModifier = true;
-      spec.singleModifierVk = mod;
-      spec.valid = true;
-      spec.display = FormatShortcut(false, false, false, false, 0, true, mod);
-      return spec;
-    }
-  }
-
-  bool hasModifier = false;
-  for (const auto& part : parts) {
-    const std::wstring lower = Lower(part);
-    if (lower == L"control" || lower == L"ctrl") {
-      spec.ctrl = true;
-      hasModifier = true;
-    } else if (lower == L"alt") {
-      spec.alt = true;
-      hasModifier = true;
-    } else if (lower == L"shift") {
-      spec.shift = true;
-      hasModifier = true;
-    } else if (lower == L"super" || lower == L"win") {
-      spec.win = true;
-      hasModifier = true;
-    } else {
-      spec.vk = VkFromName(part);
-    }
-  }
-
-  spec.valid = hasModifier && spec.vk != 0;
-  spec.display = spec.valid ? FormatShortcut(spec.ctrl, spec.alt, spec.shift, spec.win, spec.vk) : raw;
-  return spec;
 }
 
 COLORREF ColorRefFromHex(const std::wstring& hex, COLORREF fallback = RGB(0x5b, 0x6c, 0xff)) {
@@ -814,6 +1011,11 @@ class LeanCastApp {
 
   ~LeanCastApp() {
     stopThreads_ = true;
+    if (discoveryThread_.joinable()) {
+      discoveryThread_.request_stop();
+      discoveryThread_.join();
+    }
+    StopIconThreads();
     if (hook_) UnhookWindowsHookEx(hook_);
     RemoveTray();
   }
@@ -856,48 +1058,13 @@ class LeanCastApp {
       return HandleRecordingKey(vk, down, up);
     }
 
-    if (!shortcut_.valid) return CallNextHookEx(hook_, nCode, wParam, lParam);
-
-    if (shortcut_.singleModifier) {
-      const UINT generic = GenericModifier(vk);
-      const bool matches = generic == shortcut_.singleModifierVk ||
-                           (shortcut_.singleModifierVk == VK_LWIN && (vk == VK_LWIN || vk == VK_RWIN));
-      if (down) {
-        if (matches) {
-          singleModifierDown_ = true;
-          otherKeyWhileSingleModifier_ = false;
-          if (shortcut_.singleModifierVk == VK_LWIN) {
-            // Send dummy key to prevent Windows Start Menu from showing on release
-            keybd_event(0xE8, 0, 0, 0);
-            keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
-            return 1;
-          }
-          return CallNextHookEx(hook_, nCode, wParam, lParam);
-        }
-        if (singleModifierDown_) otherKeyWhileSingleModifier_ = true;
-      } else if (up && matches) {
-        if (singleModifierDown_ && !otherKeyWhileSingleModifier_) ToggleOverlay();
-        singleModifierDown_ = false;
-        otherKeyWhileSingleModifier_ = false;
-        return shortcut_.singleModifierVk == VK_LWIN ? 1 : CallNextHookEx(hook_, nCode, wParam, lParam);
-      }
-      return CallNextHookEx(hook_, nCode, wParam, lParam);
+    const auto result = shortcutRuntime_.Handle(shortcut_, vk, down, up, CurrentPressedModifiers());
+    if (result.suppressWinStart) {
+      keybd_event(0xE8, 0, 0, 0);
+      keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
     }
-
-    if (down && vk == shortcut_.vk) {
-      const bool exact = ModifierPressed(VK_CONTROL) == shortcut_.ctrl &&
-                         ModifierPressed(VK_MENU) == shortcut_.alt &&
-                         ModifierPressed(VK_SHIFT) == shortcut_.shift &&
-                         ModifierPressed(VK_LWIN) == shortcut_.win;
-      if (exact) {
-        if (!targetKeyDown_) ToggleOverlay();
-        targetKeyDown_ = true;
-        return 1;
-      }
-    } else if (up && vk == shortcut_.vk) {
-      targetKeyDown_ = false;
-    }
-
+    if (result.toggle) ToggleOverlay();
+    if (result.consume) return 1;
     return CallNextHookEx(hook_, nCode, wParam, lParam);
   }
 
@@ -1007,6 +1174,7 @@ class LeanCastApp {
   }
 
   void CreateMainWindow() {
+    const int width = OverlayWidth();
     hwnd_ = CreateWindowExW(
       WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
       kWindowClass,
@@ -1014,15 +1182,15 @@ class LeanCastApp {
       WS_POPUP,
       -32000,
       -32000,
-      WIN_WIDTH,
+      width,
       WIN_HEIGHT,
       nullptr,
       nullptr,
       instance_,
       this);
 
-    SetWindowPos(hwnd_, HWND_TOPMOST, -32000, -32000, WIN_WIDTH, WIN_HEIGHT, SWP_NOACTIVATE | SWP_HIDEWINDOW);
-    ApplyRoundedRegion(WIN_WIDTH, WIN_HEIGHT);
+    SetWindowPos(hwnd_, HWND_TOPMOST, -32000, -32000, width, WIN_HEIGHT, SWP_NOACTIVATE | SWP_HIDEWINDOW);
+    ApplyRoundedRegion(width, WIN_HEIGHT);
 
     MARGINS margins = {-1, -1, -1, -1};
     DwmExtendFrameIntoClientArea(hwnd_, &margins);
@@ -1146,18 +1314,33 @@ class LeanCastApp {
   }
 
   void StartAppDiscovery() {
-    std::thread([this] {
+    if (discoveryThread_.joinable()) {
+      discoveryThread_.request_stop();
+      discoveryThread_.join();
+    }
+
+    {
+      std::lock_guard lock(dataMutex_);
+      appsReady_ = false;
+    }
+    PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
+
+    discoveryThread_ = std::jthread([this](std::stop_token stopToken) {
       CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
       auto apps = DiscoverApps();
+      if (stopToken.stop_requested() || stopThreads_) {
+        CoUninitialize();
+        return;
+      }
       {
         std::lock_guard lock(dataMutex_);
         apps_ = std::move(apps);
         appsReady_ = true;
       }
-      PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
-      PrecacheIcons();
+      if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
+      PrecacheIcons(stopToken);
       CoUninitialize();
-    }).detach();
+    });
   }
 
   std::vector<AppEntry> DiscoverApps() {
@@ -1299,7 +1482,7 @@ class LeanCastApp {
     return out;
   }
 
-  void PrecacheIcons() {
+  void PrecacheIcons(std::stop_token stopToken) {
     std::vector<std::wstring> keys;
     {
       std::lock_guard lock(dataMutex_);
@@ -1308,13 +1491,13 @@ class LeanCastApp {
       }
     }
     caching_ = true;
-    PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
+    if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
     for (const auto& key : keys) {
-      if (stopThreads_) break;
+      if (stopToken.stop_requested() || stopThreads_) break;
       ResolveIconToCache(key);
     }
     caching_ = false;
-    PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
+    if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
   }
 
   void RefreshWindows() {
@@ -1323,6 +1506,51 @@ class LeanCastApp {
       std::lock_guard lock(dataMutex_);
       windows_ = std::move(windows);
     }
+  }
+
+  std::vector<DisplayItem> BuiltInCommands() const {
+    return {
+      CommandDisplay(CommandKind::Settings, L"Settings", L"Open LeanCast settings", {L"preferences", L"options", L"shortcut"}),
+      CommandDisplay(CommandKind::Quit, L"Quit LeanCast", L"Exit the background launcher", {L"exit", L"close"}),
+      CommandDisplay(CommandKind::Restart, L"Restart LeanCast", L"Restart the native app", {L"reload"}),
+      CommandDisplay(CommandKind::RefreshApps, L"Refresh App Index", L"Rescan Start Menu and Store apps", {L"rescan", L"reload apps"}),
+      CommandDisplay(CommandKind::ClearIconCache, L"Clear Icon Cache", L"Delete cached shell icons", {L"icons", L"cache"}),
+      CommandDisplay(CommandKind::ClearRecents, L"Clear Recents", L"Forget recently used apps", {L"history", L"recent apps"}),
+      CommandDisplay(CommandKind::OpenDataFolder, L"Open App Data Folder", L"Open the LeanCast data directory", {L"settings json", L"logs", L"cache folder"}),
+    };
+  }
+
+  std::vector<DisplayItem> ActionsFor(const DisplayItem& target) const {
+    std::vector<DisplayItem> actions;
+    if (target.isCommand || target.isAction) return actions;
+
+    if (target.isWindow) {
+      actions.push_back(ActionDisplay(ActionKind::Switch, L"Switch to Window", L"Focus " + target.window.name, target));
+      actions.push_back(ActionDisplay(ActionKind::Minimize, L"Minimize Window", L"Minimize " + target.window.name, target));
+      actions.push_back(ActionDisplay(ActionKind::MaximizeRestore, L"Maximize or Restore Window", L"Toggle window state", target));
+      actions.push_back(ActionDisplay(ActionKind::CloseWindow, L"Close Window", L"Send close request", target));
+      return actions;
+    }
+
+    actions.push_back(ActionDisplay(ActionKind::Open, L"Open", L"Launch " + target.app.name, target));
+    if (target.app.adminSupported) {
+      actions.push_back(ActionDisplay(ActionKind::RunAsAdmin, L"Run as Administrator", L"Launch elevated", target));
+    }
+    if (!target.app.path.empty() || !target.app.targetPath.empty()) {
+      actions.push_back(ActionDisplay(ActionKind::OpenLocation, L"Open File Location", L"Show app shortcut or target", target));
+      actions.push_back(ActionDisplay(ActionKind::CopyPath, L"Copy Path", L"Copy app shortcut or target path", target));
+    }
+    if (ContainsAnyAppKey(settings_.pinnedApps, target.app)) {
+      actions.push_back(ActionDisplay(ActionKind::Unpin, L"Unpin", L"Remove from pinned apps", target));
+    } else {
+      actions.push_back(ActionDisplay(ActionKind::Pin, L"Pin", L"Keep near the top of results", target));
+    }
+    if (ContainsAnyAppKey(settings_.hiddenApps, target.app)) {
+      actions.push_back(ActionDisplay(ActionKind::Unhide, L"Unhide", L"Show in launcher results", target));
+    } else {
+      actions.push_back(ActionDisplay(ActionKind::Hide, L"Hide", L"Remove from launcher results", target));
+    }
+    return actions;
   }
 
   void BuildSections() {
@@ -1352,7 +1580,7 @@ class LeanCastApp {
     };
 
     const bool empty = Trim(query_).empty();
-    if (settings_.compactMode && empty && view_ == View::Search) {
+    if (settings_.compactMode && empty && view_ == View::Search && !actionMode_) {
       sections_.clear();
       flatItems_.clear();
       selected_ = 0;
@@ -1361,16 +1589,48 @@ class LeanCastApp {
     }
 
     std::vector<DisplayItem> appItems;
-    for (const auto& app : apps) appItems.push_back(DisplayItem{false, app, {}});
+    for (const auto& app : apps) {
+      if (ContainsAnyAppKey(settings_.hiddenApps, app)) continue;
+      if (!settings_.showStoreApps && IsStoreLikeSource(app.source)) continue;
+      appItems.push_back(AppDisplay(app));
+    }
     std::vector<DisplayItem> windowItems;
-    for (const auto& window : windows) windowItems.push_back(DisplayItem{true, {}, window});
+    if (settings_.showOpenWindows) {
+      for (const auto& window : windows) windowItems.push_back(WindowDisplay(window));
+    }
+    const auto commandItems = BuiltInCommands();
+
+    if (actionMode_) {
+      const auto actions = ActionsFor(actionTarget_);
+      if (empty) {
+        addSection(L"Actions", take(actions));
+      } else {
+        std::vector<leancast::core::SearchItem> searchItems;
+        for (const auto& item : actions) searchItems.push_back(ToSearchItem(item));
+        auto order = leancast::core::Search(query_, searchItems);
+        std::vector<DisplayItem> hits;
+        for (const auto index : order) hits.push_back(actions[index]);
+        addSection(L"Actions", take(hits));
+      }
+
+      sections_ = std::move(sections);
+      flatItems_.clear();
+      for (const auto& section : sections_) {
+        flatItems_.insert(flatItems_.end(), section.items.begin(), section.items.end());
+      }
+      if (selected_ >= static_cast<int>(flatItems_.size())) selected_ = std::max<int>(0, static_cast<int>(flatItems_.size()) - 1);
+      ApplyWindowSize();
+      return;
+    }
 
     if (empty) {
       std::map<std::wstring, DisplayItem> byId;
       for (const auto& item : appItems) {
-        byId[item.app.id] = item;
-        if (!item.app.path.empty()) byId[item.app.path] = item;
-        if (!item.app.launchTarget.empty()) byId[item.app.launchTarget] = item;
+        for (const auto& key : AppKeys(item.app)) byId[key] = item;
+      }
+      std::vector<DisplayItem> pinned;
+      for (const auto& item : appItems) {
+        if (ContainsAnyAppKey(settings_.pinnedApps, item.app)) pinned.push_back(item);
       }
       std::vector<DisplayItem> recent;
       for (const auto& id : settings_.recentApps) {
@@ -1380,18 +1640,26 @@ class LeanCastApp {
       for (const auto& item : appItems) {
         if (item.app.systemEssential || item.app.source == L"alias") system.push_back(item);
       }
+      addSection(L"Pinned", take(pinned, 12));
       addSection(L"Recently used", take(recent, 8));
       addSection(L"Open windows", take(windowItems));
       addSection(L"System essentials", take(system, 8));
+      addSection(L"Commands", take(commandItems, 8));
     } else {
+      if (const auto calculation = leancast::calculator::TryEvaluate(query_)) {
+        addSection(L"Calculator", take({CalculatorDisplay(*calculation)}, 1));
+      }
+
       std::vector<DisplayItem> pool = windowItems;
       pool.insert(pool.end(), appItems.begin(), appItems.end());
+      pool.insert(pool.end(), commandItems.begin(), commandItems.end());
 
       std::vector<leancast::core::SearchItem> searchItems;
       for (const auto& item : pool) searchItems.push_back(ToSearchItem(item));
       std::set<std::wstring> recentIds(settings_.recentApps.begin(), settings_.recentApps.end());
       auto order = leancast::core::Search(query_, searchItems, recentIds);
-      if (order.size() > MAX_RESULTS) order.resize(MAX_RESULTS);
+      const size_t limit = static_cast<size_t>(std::clamp(settings_.maxResults, MIN_RESULTS, MAX_RESULT_SETTING));
+      if (order.size() > limit) order.resize(limit);
 
       std::vector<DisplayItem> hits;
       for (const auto index : order) hits.push_back(pool[index]);
@@ -1403,14 +1671,17 @@ class LeanCastApp {
       std::vector<DisplayItem> appsOnly;
       std::vector<DisplayItem> open;
       std::vector<DisplayItem> system;
+      std::vector<DisplayItem> commands;
       std::vector<DisplayItem> other;
       for (const auto& item : rest) {
-        if (!item.isWindow && recentIds.contains(item.app.id)) recent.push_back(item);
-        if (!item.isWindow && item.app.source == L"shortcut") appsOnly.push_back(item);
+        if (item.isCommand) commands.push_back(item);
+        if (!item.isWindow && !item.isCommand && recentIds.contains(PrimaryAppId(item.app))) recent.push_back(item);
+        if (!item.isWindow && !item.isCommand && item.app.source == L"shortcut") appsOnly.push_back(item);
         if (item.isWindow) open.push_back(item);
-        if (!item.isWindow && item.app.source != L"shortcut") system.push_back(item);
+        if (!item.isWindow && !item.isCommand && item.app.source != L"shortcut") system.push_back(item);
         other.push_back(item);
       }
+      addSection(L"Commands", take(commands, 20));
       addSection(L"Recently used", take(recent, 8));
       addSection(L"Apps", take(appsOnly, 80));
       addSection(L"Open windows", take(open, 40));
@@ -1429,7 +1700,29 @@ class LeanCastApp {
 
   leancast::core::SearchItem ToSearchItem(const DisplayItem& item) {
     leancast::core::SearchItem out;
-    if (item.isWindow) {
+    if (item.isCalculator) {
+      out.id = item.Key();
+      out.kind = L"calculator";
+      out.source = L"calculator";
+      out.name = item.calculationResult;
+      out.keywords = item.commandKeywords;
+      out.systemEssential = true;
+    } else if (item.isCommand) {
+      out.id = item.Key();
+      out.kind = L"command";
+      out.source = L"command";
+      out.name = item.commandName;
+      out.keywords = item.commandKeywords;
+      out.systemEssential = true;
+    } else if (item.isAction) {
+      out.id = item.Key();
+      out.kind = L"action";
+      out.source = L"action";
+      out.name = item.commandName;
+      out.keywords = item.commandKeywords;
+      out.keywords.push_back(item.commandDetail);
+      out.systemEssential = true;
+    } else if (item.isWindow) {
       out.id = L"win:" + std::to_wstring(reinterpret_cast<uintptr_t>(item.window.hwnd));
       out.kind = L"window";
       out.name = item.window.name;
@@ -1445,6 +1738,16 @@ class LeanCastApp {
       out.launchTarget = item.app.launchTarget;
       out.keywords = item.app.keywords;
       out.systemEssential = item.app.systemEssential;
+      out.pinned = ContainsAnyAppKey(settings_.pinnedApps, item.app);
+      for (const auto& key : AppKeys(item.app)) {
+        if (auto alias = settings_.appAliases.find(key); alias != settings_.appAliases.end()) {
+          out.keywords.push_back(alias->second);
+        }
+        if (auto usage = settings_.usageStats.find(key); usage != settings_.usageStats.end()) {
+          out.usageCount = std::max(out.usageCount, usage->second.launches);
+          out.lastUsed = std::max(out.lastUsed, usage->second.lastUsed);
+        }
+      }
     }
     return out;
   }
@@ -1456,7 +1759,8 @@ class LeanCastApp {
       if (foreground && foreground != hwnd_) lastActiveWindow_ = foreground;
     }
     RefreshWindows();
-    query_.clear();
+    actionMode_ = false;
+    ClearQuery();
     selected_ = 0;
     scroll_ = 0;
     BuildSections();
@@ -1502,13 +1806,85 @@ class LeanCastApp {
     else ShowOverlay(View::Search);
   }
 
+  void EnterActionMode(const DisplayItem& target) {
+    if (target.isCommand || target.isAction) return;
+    actionMode_ = true;
+    actionTarget_ = target;
+    ClearQuery();
+    selected_ = 0;
+    scroll_ = 0;
+    BuildSections();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void ExitActionMode() {
+    actionMode_ = false;
+    ClearQuery();
+    selected_ = 0;
+    scroll_ = 0;
+    BuildSections();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void ClearQuery() {
+    query_.clear();
+    caret_ = 0;
+  }
+
+  void ClampCaret() {
+    caret_ = std::min(caret_, query_.size());
+  }
+
+  void SetCaretFromSearchClick(float x) {
+    ClampCaret();
+    if (query_.empty() || !dwriteFactory_) {
+      caret_ = query_.size();
+      return;
+    }
+
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    const float width = static_cast<float>(rc.right - rc.left);
+    const float textLeft = 52.0f;
+    const float textWidth = std::max(1.0f, width - 94.0f - textLeft);
+    if (x <= textLeft) {
+      caret_ = 0;
+      return;
+    }
+    if (x >= textLeft + textWidth) {
+      caret_ = query_.size();
+      return;
+    }
+
+    ComPtr<IDWriteTextLayout> layout;
+    const HRESULT hr = dwriteFactory_->CreateTextLayout(
+        query_.c_str(),
+        static_cast<UINT32>(query_.size()),
+        inputFormat_.Get(),
+        textWidth,
+        48.0f,
+        layout.GetAddressOf());
+    if (FAILED(hr)) {
+      caret_ = query_.size();
+      return;
+    }
+
+    BOOL trailing = FALSE;
+    BOOL inside = FALSE;
+    DWRITE_HIT_TEST_METRICS metrics{};
+    if (SUCCEEDED(layout->HitTestPoint(x - textLeft, 24.0f, &trailing, &inside, &metrics))) {
+      caret_ = static_cast<size_t>(metrics.textPosition + (trailing ? metrics.length : 0));
+      ClampCaret();
+    }
+  }
+
   void PositionWindow() {
     POINT cursor{};
     GetCursorPos(&cursor);
     HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(monitor, &mi);
-    const int width = WIN_WIDTH;
+    const int width = OverlayWidth();
     const int height = CurrentHeight();
     const int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - width) / 2;
     const int y = mi.rcWork.top + static_cast<int>((mi.rcWork.bottom - mi.rcWork.top) * 0.22);
@@ -1525,9 +1901,9 @@ class LeanCastApp {
   }
 
   int CurrentHeight() const {
-    if (view_ == View::Settings) return 600;
+    if (view_ == View::Settings) return 820;
     if (!settings_.compactMode) return WIN_HEIGHT;
-    if (Trim(query_).empty()) return COMPACT_BASE_HEIGHT;
+    if (Trim(query_).empty() && !actionMode_) return COMPACT_BASE_HEIGHT;
     POINT cursor{};
     GetCursorPos(&cursor);
     HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
@@ -1539,14 +1915,19 @@ class LeanCastApp {
 
   void ApplyWindowSize() {
     const int height = CurrentHeight();
+    const int width = OverlayWidth();
     RECT rc{};
     GetWindowRect(hwnd_, &rc);
     const int currentWidth = rc.right - rc.left;
     const int currentHeight = rc.bottom - rc.top;
-    if (currentWidth != WIN_WIDTH || currentHeight != height) {
-      SetWindowPos(hwnd_, HWND_TOPMOST, rc.left, rc.top, WIN_WIDTH, height, SWP_NOACTIVATE | SWP_NOMOVE);
-      ApplyRoundedRegion(WIN_WIDTH, height);
+    if (currentWidth != width || currentHeight != height) {
+      SetWindowPos(hwnd_, HWND_TOPMOST, rc.left, rc.top, width, height, SWP_NOACTIVATE | SWP_NOMOVE);
+      ApplyRoundedRegion(width, height);
     }
+  }
+
+  int OverlayWidth() const {
+    return std::clamp(settings_.overlayWidth, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
   }
 
   void ApplyRoundedRegion(int width, int height) {
@@ -1644,16 +2025,19 @@ class LeanCastApp {
     StrokeRound({0.5f, 0.5f, width - 0.5f, height - 0.5f}, 14, D2D1::ColorF(1, 1, 1, 0.08f));
 
     DrawSearchIcon(18, 20, D2D1::ColorF(0.60f, 0.60f, 0.64f, 1));
-    const std::wstring input = query_.empty() ? L"Search apps or windows..." : query_;
+    const std::wstring input = query_.empty()
+        ? (actionMode_ ? L"Actions for " + actionTarget_.Name() : L"Search apps, windows, or commands...")
+        : query_;
     DrawTextBlock(input, {52, 15, width - 94, 48}, inputFormat_.Get(), query_.empty() ? D2D1::ColorF(0.60f, 0.60f, 0.64f) : D2D1::ColorF(0.95f, 0.95f, 0.96f));
 
-    // Draw blinking caret
     float caretX = 52.0f;
     if (!query_.empty()) {
+      ClampCaret();
+      const std::wstring beforeCaret = query_.substr(0, caret_);
       ComPtr<IDWriteTextLayout> layout;
       HRESULT hr = dwriteFactory_->CreateTextLayout(
-          query_.c_str(),
-          static_cast<UINT32>(query_.size()),
+          beforeCaret.c_str(),
+          static_cast<UINT32>(beforeCaret.size()),
           inputFormat_.Get(),
           width - 94 - 52,
           48,
@@ -1687,7 +2071,7 @@ class LeanCastApp {
       renderTarget_->DrawLine(D2D1::Point2F(0, 60), D2D1::Point2F(width, 60), border.Get(), 1);
     }
 
-    if (settings_.compactMode && query_.empty()) return;
+    if (settings_.compactMode && query_.empty() && !actionMode_) return;
 
     const bool showFooter = !settings_.compactMode;
     const float footerHeight = showFooter ? 40.0f : 0.0f;
@@ -1724,7 +2108,7 @@ class LeanCastApp {
       auto border = Brush(D2D1::ColorF(1, 1, 1, 0.06f));
       renderTarget_->DrawLine(D2D1::Point2F(0, height - 40.0f), D2D1::Point2F(width, height - 40.0f), border.Get(), 1.0f);
       DrawTextBlock(L"LeanCast", {16, height - 28.0f, 160, height - 12.0f}, footerFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
-      DrawTextBlock(L"Up/Down Navigate | Enter Open | Ctrl+Shift+Enter Admin | Esc Close", {200, height - 28.0f, width - 16.0f, height - 12.0f}, footerRightFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
+      DrawTextBlock(L"Up/Down Navigate | Enter Open | Tab Actions | Esc Close", {200, height - 28.0f, width - 16.0f, height - 12.0f}, footerRightFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
     }
   }
 
@@ -1753,6 +2137,8 @@ class LeanCastApp {
   }
 
   std::wstring SourceLabel(const DisplayItem& item) const {
+    if (item.isCalculator) return item.commandDetail;
+    if (item.isCommand || item.isAction) return item.commandDetail;
     if (item.isWindow) return item.window.processName.empty() ? L"Open window" : L"Open window - " + item.window.processName;
     if (item.app.source == L"shortcut") return L"Desktop app";
     if (item.app.source == L"alias") return L"System app";
@@ -1761,8 +2147,11 @@ class LeanCastApp {
   }
 
   std::wstring ActionHint(const DisplayItem& item) const {
+    if (item.isCalculator) return L"Enter Copy";
+    if (item.isCommand) return L"Enter Run";
+    if (item.isAction) return L"Enter Apply";
     if (item.isWindow) return L"Enter Switch";
-    return item.app.adminSupported ? L"Enter Open | Ctrl+Shift Admin" : L"Enter Open";
+    return item.app.adminSupported ? L"Enter Open | Tab Actions | Ctrl+Shift Admin" : L"Enter Open | Tab Actions";
   }
 
   void DrawSettings() {
@@ -1823,6 +2212,38 @@ class LeanCastApp {
     DrawToggle({20, y, 120, y + 34}, settings_.compactMode, settings_.compactMode ? L"On" : L"Off", HitType::CompactToggle);
 
     y += 48;
+    DrawTextBlock(L"Open Window Results", {20, y, width - 20, y + 20}, labelFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
+    y += 22;
+    DrawTextBlock(L"Include currently open windows in search results.", {20, y, width - 20, y + 20}, bodyFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
+    y += 28;
+    DrawToggle({20, y, 120, y + 34}, settings_.showOpenWindows, settings_.showOpenWindows ? L"On" : L"Off", HitType::ShowWindowsToggle);
+
+    y += 48;
+    DrawTextBlock(L"Store/System Apps", {20, y, width - 20, y + 20}, labelFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
+    y += 22;
+    DrawTextBlock(L"Include AppsFolder, Store, and system alias entries.", {20, y, width - 20, y + 20}, bodyFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
+    y += 28;
+    DrawToggle({20, y, 120, y + 34}, settings_.showStoreApps, settings_.showStoreApps ? L"On" : L"Off", HitType::ShowStoreAppsToggle);
+
+    y += 48;
+    DrawTextBlock(L"Overlay Width", {20, y, width - 20, y + 20}, labelFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
+    DrawTextBlock(std::to_wstring(OverlayWidth()) + L" px", {180, y, 280, y + 20}, bodyFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
+    DrawSettingsButton({width - 130, y - 6, width - 80, y + 28}, L"-", HitType::OverlayWidthDown);
+    DrawSettingsButton({width - 70, y - 6, width - 20, y + 28}, L"+", HitType::OverlayWidthUp);
+
+    y += 46;
+    DrawTextBlock(L"Max Results", {20, y, width - 20, y + 20}, labelFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
+    DrawTextBlock(std::to_wstring(std::clamp(settings_.maxResults, MIN_RESULTS, MAX_RESULT_SETTING)), {180, y, 280, y + 20}, bodyFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
+    DrawSettingsButton({width - 130, y - 6, width - 80, y + 28}, L"-", HitType::MaxResultsDown);
+    DrawSettingsButton({width - 70, y - 6, width - 20, y + 28}, L"+", HitType::MaxResultsUp);
+
+    y += 46;
+    DrawTextBlock(L"Maintenance", {20, y, width - 20, y + 20}, labelFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
+    y += 28;
+    DrawSettingsButton({20, y, 160, y + 34}, L"Clear Recents", HitType::ClearRecents);
+    DrawSettingsButton({176, y, 336, y + 34}, L"Clear Icon Cache", HitType::ClearIconCache);
+
+    y += 52;
     DrawTextBlock(L"Accent Color", {20, y, width - 20, y + 20}, labelFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
     y += 22;
     DrawTextBlock(L"Choose between auto-syncing with Windows or selecting a custom color.", {20, y, width - 20, y + 20}, bodyFormat_.Get(), D2D1::ColorF(0.60f, 0.60f, 0.64f));
@@ -1850,6 +2271,13 @@ class LeanCastApp {
     hits_.push_back({rect, type});
   }
 
+  void DrawSettingsButton(RectF rect, const std::wstring& text, HitType type) {
+    FillRound(rect, 8, D2D1::ColorF(0.09f, 0.09f, 0.11f));
+    StrokeRound(rect, 8, D2D1::ColorF(1, 1, 1, 0.16f));
+    DrawTextBlock(text, rect, centerFormat_.Get(), D2D1::ColorF(0.95f, 0.95f, 0.96f));
+    hits_.push_back({rect, type});
+  }
+
   ComPtr<ID2D1Bitmap> IconBitmap(const std::wstring& key) {
     if (key.empty() || !renderTarget_) return nullptr;
     if (iconBitmaps_.contains(key)) return iconBitmaps_[key];
@@ -1874,16 +2302,18 @@ class LeanCastApp {
       if (pendingIcons_.contains(key)) return;
       pendingIcons_.insert(key);
     }
-    std::thread([this, key] {
+
+    std::lock_guard threadLock(workerThreadsMutex_);
+    iconThreads_.emplace_back([this, key](std::stop_token stopToken) {
       CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-      ResolveIconToCache(key);
+      if (!stopToken.stop_requested() && !stopThreads_) ResolveIconToCache(key);
       {
         std::lock_guard lock(iconQueueMutex_);
         pendingIcons_.erase(key);
       }
-      PostMessageW(hwnd_, WM_ICON_READY, 0, 0);
+      if (!stopToken.stop_requested() && !stopThreads_) PostMessageW(hwnd_, WM_ICON_READY, 0, 0);
       CoUninitialize();
-    }).detach();
+    });
   }
 
   ComPtr<ID2D1Bitmap> LoadBitmapFromFile(const std::filesystem::path& path) {
@@ -2000,7 +2430,9 @@ class LeanCastApp {
 
   void OnKeyDown(UINT vk) {
     if (vk == VK_ESCAPE) {
-      if (view_ == View::Settings) {
+      if (view_ == View::Search && actionMode_) {
+        ExitActionMode();
+      } else if (view_ == View::Settings) {
         recording_ = false;
         view_ = View::Search;
         BuildSections();
@@ -2021,14 +2453,72 @@ class LeanCastApp {
       selected_ = std::max(0, selected_ - 1);
       EnsureSelectedVisible();
       InvalidateRect(hwnd_, nullptr, FALSE);
+    } else if (vk == VK_HOME) {
+      if (!query_.empty()) {
+        caret_ = 0;
+      } else {
+        selected_ = 0;
+        EnsureSelectedVisible();
+      }
+      InvalidateRect(hwnd_, nullptr, FALSE);
+    } else if (vk == VK_END) {
+      if (!query_.empty()) {
+        caret_ = query_.size();
+      } else {
+        if (!flatItems_.empty()) selected_ = static_cast<int>(flatItems_.size()) - 1;
+        EnsureSelectedVisible();
+      }
+      InvalidateRect(hwnd_, nullptr, FALSE);
+    } else if (vk == VK_PRIOR) {
+      selected_ = std::max(0, selected_ - 8);
+      EnsureSelectedVisible();
+      InvalidateRect(hwnd_, nullptr, FALSE);
+    } else if (vk == VK_NEXT) {
+      if (!flatItems_.empty()) selected_ = std::min<int>(selected_ + 8, static_cast<int>(flatItems_.size()) - 1);
+      EnsureSelectedVisible();
+      InvalidateRect(hwnd_, nullptr, FALSE);
+    } else if (vk == VK_RIGHT) {
+      if (caret_ < query_.size()) {
+        ++caret_;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+      } else if (query_.empty() && selected_ >= 0 && selected_ < static_cast<int>(flatItems_.size())) {
+        EnterActionMode(flatItems_[selected_]);
+      }
+    } else if (vk == VK_TAB) {
+      if (selected_ >= 0 && selected_ < static_cast<int>(flatItems_.size())) EnterActionMode(flatItems_[selected_]);
+    } else if (vk == VK_LEFT) {
+      if (caret_ > 0) {
+        --caret_;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+      } else if (actionMode_) {
+        ExitActionMode();
+      }
     } else if (vk == VK_RETURN) {
       if (selected_ >= 0 && selected_ < static_cast<int>(flatItems_.size())) {
         const bool admin = ModifierPressed(VK_CONTROL) && ModifierPressed(VK_SHIFT);
         Activate(flatItems_[selected_], admin);
       }
     } else if (vk == VK_BACK) {
-      if (!query_.empty()) {
-        query_.pop_back();
+      if (!query_.empty() && caret_ > 0) {
+        if (ModifierPressed(VK_CONTROL)) {
+          while (caret_ > 0 && std::iswspace(query_[caret_ - 1])) query_.erase(--caret_, 1);
+          while (caret_ > 0 && !std::iswspace(query_[caret_ - 1])) query_.erase(--caret_, 1);
+        } else {
+          query_.erase(--caret_, 1);
+        }
+        selected_ = 0;
+        scroll_ = 0;
+        BuildSections();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+      }
+    } else if (vk == VK_DELETE) {
+      if (!query_.empty() && caret_ < query_.size()) {
+        if (ModifierPressed(VK_CONTROL)) {
+          while (caret_ < query_.size() && std::iswspace(query_[caret_])) query_.erase(caret_, 1);
+          while (caret_ < query_.size() && !std::iswspace(query_[caret_])) query_.erase(caret_, 1);
+        } else {
+          query_.erase(caret_, 1);
+        }
         selected_ = 0;
         scroll_ = 0;
         BuildSections();
@@ -2040,7 +2530,9 @@ class LeanCastApp {
   void OnChar(wchar_t ch) {
     if (view_ != View::Search) return;
     if (ch >= 32 && ch != 127) {
-      query_.push_back(ch);
+      ClampCaret();
+      query_.insert(query_.begin() + static_cast<std::ptrdiff_t>(caret_), ch);
+      ++caret_;
       selected_ = 0;
       scroll_ = 0;
       BuildSections();
@@ -2083,6 +2575,17 @@ class LeanCastApp {
   }
 
   void OnClick(float x, float y) {
+    if (view_ == View::Search) {
+      RECT rc{};
+      GetClientRect(hwnd_, &rc);
+      const float width = static_cast<float>(rc.right - rc.left);
+      if (PointInRect({0, 0, width - 60.0f, 60.0f}, x, y)) {
+        SetCaretFromSearchClick(x);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      }
+    }
+
     for (const auto& hit : hits_) {
       if (!PointInRect(hit.rect, x, y)) continue;
       switch (hit.type) {
@@ -2127,6 +2630,55 @@ class LeanCastApp {
           settings_.startOnStartup = !settings_.startOnStartup;
           SetStartOnStartup(settings_.startOnStartup);
           SaveSettings(settings_);
+          InvalidateRect(hwnd_, nullptr, FALSE);
+          return;
+        case HitType::ShowWindowsToggle:
+          settings_.showOpenWindows = !settings_.showOpenWindows;
+          SaveSettings(settings_);
+          RefreshWindows();
+          BuildSections();
+          InvalidateRect(hwnd_, nullptr, FALSE);
+          return;
+        case HitType::ShowStoreAppsToggle:
+          settings_.showStoreApps = !settings_.showStoreApps;
+          SaveSettings(settings_);
+          BuildSections();
+          InvalidateRect(hwnd_, nullptr, FALSE);
+          return;
+        case HitType::ClearRecents:
+          settings_.recentApps.clear();
+          settings_.usageStats.clear();
+          SaveSettings(settings_);
+          BuildSections();
+          InvalidateRect(hwnd_, nullptr, FALSE);
+          return;
+        case HitType::ClearIconCache:
+          ClearIconCache();
+          return;
+        case HitType::OverlayWidthDown:
+          settings_.overlayWidth = std::clamp(OverlayWidth() - 40, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
+          SaveSettings(settings_);
+          PositionWindow();
+          ApplyWindowSize();
+          InvalidateRect(hwnd_, nullptr, FALSE);
+          return;
+        case HitType::OverlayWidthUp:
+          settings_.overlayWidth = std::clamp(OverlayWidth() + 40, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
+          SaveSettings(settings_);
+          PositionWindow();
+          ApplyWindowSize();
+          InvalidateRect(hwnd_, nullptr, FALSE);
+          return;
+        case HitType::MaxResultsDown:
+          settings_.maxResults = std::clamp(settings_.maxResults - 25, MIN_RESULTS, MAX_RESULT_SETTING);
+          SaveSettings(settings_);
+          BuildSections();
+          InvalidateRect(hwnd_, nullptr, FALSE);
+          return;
+        case HitType::MaxResultsUp:
+          settings_.maxResults = std::clamp(settings_.maxResults + 25, MIN_RESULTS, MAX_RESULT_SETTING);
+          SaveSettings(settings_);
+          BuildSections();
           InvalidateRect(hwnd_, nullptr, FALSE);
           return;
         case HitType::CompactToggle:
@@ -2176,6 +2728,22 @@ class LeanCastApp {
   }
 
   void Activate(const DisplayItem& item, bool asAdmin) {
+    if (item.isCalculator) {
+      CopyTextToClipboard(item.calculationResult);
+      HideOverlay(false);
+      return;
+    }
+
+    if (item.isCommand) {
+      ExecuteCommand(item.command);
+      return;
+    }
+
+    if (item.isAction) {
+      ExecuteAction(item);
+      return;
+    }
+
     if (item.isWindow) {
       HideOverlay(false);
       FocusWindow(item.window.hwnd);
@@ -2184,7 +2752,199 @@ class LeanCastApp {
 
     HideOverlay(false);
     const bool ok = LaunchApp(item.app, asAdmin && item.app.adminSupported);
-    if (ok) TrackRecent(item.app.id.empty() ? item.app.path : item.app.id);
+    if (ok) TrackRecent(PrimaryAppId(item.app));
+  }
+
+  void ExecuteCommand(CommandKind command) {
+    switch (command) {
+      case CommandKind::Settings:
+        actionMode_ = false;
+        view_ = View::Settings;
+        ClearQuery();
+        selected_ = 0;
+        scroll_ = 0;
+        ApplyWindowSize();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      case CommandKind::Quit:
+        DestroyWindow(hwnd_);
+        return;
+      case CommandKind::Restart:
+        RestartApp();
+        return;
+      case CommandKind::RefreshApps:
+        StartAppDiscovery();
+        ClearQuery();
+        selected_ = 0;
+        scroll_ = 0;
+        BuildSections();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      case CommandKind::ClearIconCache:
+        ClearIconCache();
+        return;
+      case CommandKind::ClearRecents:
+        settings_.recentApps.clear();
+        settings_.usageStats.clear();
+        SaveSettings(settings_);
+        BuildSections();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      case CommandKind::OpenDataFolder:
+        ShellExecuteW(nullptr, L"open", UserDataPath().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        HideOverlay(false);
+        return;
+    }
+  }
+
+  void ExecuteAction(const DisplayItem& item) {
+    if (item.actionTargetIsWindow) {
+      HWND target = item.actionWindow.hwnd;
+      if (!target || !IsWindow(target)) {
+        actionMode_ = false;
+        RefreshWindows();
+        BuildSections();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      }
+
+      switch (item.action) {
+        case ActionKind::Switch:
+          HideOverlay(false);
+          FocusWindow(target);
+          return;
+        case ActionKind::Minimize:
+          ShowWindowAsync(target, SW_MINIMIZE);
+          HideOverlay(false);
+          return;
+        case ActionKind::MaximizeRestore:
+          if (IsIconic(target) || IsZoomed(target)) ShowWindowAsync(target, SW_RESTORE);
+          else ShowWindowAsync(target, SW_MAXIMIZE);
+          HideOverlay(false);
+          return;
+        case ActionKind::CloseWindow:
+          PostMessageW(target, WM_CLOSE, 0, 0);
+          HideOverlay(false);
+          return;
+        default:
+          return;
+      }
+    }
+
+    const AppEntry& app = item.actionApp;
+    const std::wstring id = PrimaryAppId(app);
+    switch (item.action) {
+      case ActionKind::Open:
+      case ActionKind::RunAsAdmin: {
+        HideOverlay(false);
+        const bool ok = LaunchApp(app, item.action == ActionKind::RunAsAdmin && app.adminSupported);
+        if (ok) TrackRecent(id);
+        return;
+      }
+      case ActionKind::OpenLocation:
+        RevealAppLocation(app);
+        HideOverlay(false);
+        return;
+      case ActionKind::CopyPath:
+        CopyTextToClipboard(AppPathForActions(app));
+        HideOverlay(false);
+        return;
+      case ActionKind::Pin:
+        if (!id.empty() && !ContainsValue(settings_.pinnedApps, id)) settings_.pinnedApps.insert(settings_.pinnedApps.begin(), id);
+        SaveSettings(settings_);
+        actionMode_ = false;
+        BuildSections();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      case ActionKind::Unpin:
+        for (const auto& key : AppKeys(app)) RemoveValue(settings_.pinnedApps, key);
+        SaveSettings(settings_);
+        actionMode_ = false;
+        BuildSections();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      case ActionKind::Hide:
+        if (!id.empty() && !ContainsValue(settings_.hiddenApps, id)) settings_.hiddenApps.push_back(id);
+        SaveSettings(settings_);
+        actionMode_ = false;
+        BuildSections();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      case ActionKind::Unhide:
+        for (const auto& key : AppKeys(app)) RemoveValue(settings_.hiddenApps, key);
+        SaveSettings(settings_);
+        actionMode_ = false;
+        BuildSections();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      default:
+        return;
+    }
+  }
+
+  std::wstring AppPathForActions(const AppEntry& app) const {
+    if (!app.path.empty()) return app.path;
+    if (!app.targetPath.empty()) return app.targetPath;
+    return app.launchTarget;
+  }
+
+  void RevealAppLocation(const AppEntry& app) const {
+    const std::wstring path = AppPathForActions(app);
+    if (path.empty()) return;
+    const std::wstring args = L"/select,\"" + path + L"\"";
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+  }
+
+  void CopyTextToClipboard(const std::wstring& text) {
+    if (text.empty() || !OpenClipboard(hwnd_)) return;
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (memory) {
+      void* buffer = GlobalLock(memory);
+      if (buffer) {
+        memcpy(buffer, text.c_str(), bytes);
+        GlobalUnlock(memory);
+        SetClipboardData(CF_UNICODETEXT, memory);
+        memory = nullptr;
+      }
+      if (memory) GlobalFree(memory);
+    }
+    CloseClipboard();
+  }
+
+  void ClearIconCache() {
+    StopIconThreads();
+    {
+      std::lock_guard lock(iconQueueMutex_);
+      pendingIcons_.clear();
+    }
+    iconBitmaps_.clear();
+    std::error_code ec;
+    std::filesystem::remove_all(IconCacheDir(), ec);
+    std::filesystem::create_directories(IconCacheDir(), ec);
+    StartAppDiscovery();
+    BuildSections();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void StopIconThreads() {
+    std::lock_guard lock(workerThreadsMutex_);
+    for (auto& thread : iconThreads_) {
+      if (thread.joinable()) thread.request_stop();
+    }
+    for (auto& thread : iconThreads_) {
+      if (thread.joinable()) thread.join();
+    }
+    iconThreads_.clear();
+  }
+
+  void RestartApp() {
+    wchar_t exePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    const std::wstring command = L"/c timeout /t 1 /nobreak >nul & start \"\" \"" + std::wstring(exePath) + L"\" --show";
+    ShellExecuteW(nullptr, L"open", L"cmd.exe", command.c_str(), nullptr, SW_HIDE);
+    DestroyWindow(hwnd_);
   }
 
   bool LaunchApp(const AppEntry& app, bool asAdmin) {
@@ -2226,6 +2986,9 @@ class LeanCastApp {
       if (next.size() >= RECENT_LIMIT) break;
     }
     settings_.recentApps = std::move(next);
+    auto& usage = settings_.usageStats[id];
+    usage.launches = std::min(usage.launches + 1, 1000000);
+    usage.lastUsed = UnixNow();
     SaveSettings(settings_);
   }
 
@@ -2262,18 +3025,22 @@ class LeanCastApp {
   bool suppressHide_ = false;
   View view_ = View::Search;
   std::wstring query_;
+  size_t caret_ = 0;
   int selected_ = 0;
   int scroll_ = 0;
+  bool actionMode_ = false;
+  DisplayItem actionTarget_;
   bool recording_ = false;
   std::wstring pendingShortcut_;
   UINT lastModifierPressed_ = 0;
   bool otherKeyWhileRecordingModifier_ = false;
-  bool singleModifierDown_ = false;
-  bool otherKeyWhileSingleModifier_ = false;
-  bool targetKeyDown_ = false;
+  ShortcutRuntime shortcutRuntime_;
   std::atomic<bool> stopThreads_ = false;
   std::atomic<bool> caching_ = false;
   bool appsReady_ = false;
+  std::jthread discoveryThread_;
+  std::mutex workerThreadsMutex_;
+  std::vector<std::jthread> iconThreads_;
   std::mutex dataMutex_;
   std::vector<AppEntry> apps_;
   std::vector<WindowEntry> windows_;

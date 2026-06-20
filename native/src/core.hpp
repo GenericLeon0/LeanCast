@@ -20,6 +20,9 @@ struct SearchItem {
   std::wstring exe;
   std::vector<std::wstring> keywords;
   bool systemEssential = false;
+  bool pinned = false;
+  int usageCount = 0;
+  long long lastUsed = 0;
 };
 
 inline std::wstring Trim(std::wstring value) {
@@ -55,6 +58,14 @@ inline std::vector<std::wstring> Tokens(const std::wstring& value) {
   return out;
 }
 
+inline std::wstring Acronym(const std::wstring& value) {
+  std::wstring out;
+  for (const auto& token : Tokens(value)) {
+    if (!token.empty()) out.push_back(token.front());
+  }
+  return out;
+}
+
 inline bool BoundaryBefore(const std::wstring& text, size_t index) {
   if (index == 0) return true;
   const wchar_t ch = text[index - 1];
@@ -67,6 +78,12 @@ inline double ScoreText(const std::wstring& query, const std::wstring& target) {
   if (q.empty() || t.empty()) return -1;
   if (t == q) return 5000;
   if (t.rfind(q, 0) == 0) return 3200 - std::min<int>(static_cast<int>(t.size() - q.size()), 200);
+
+  const std::wstring acronym = Acronym(t);
+  if (!acronym.empty()) {
+    if (acronym == q) return 3000;
+    if (acronym.rfind(q, 0) == 0) return 2300 - std::min<int>(static_cast<int>(acronym.size() - q.size()), 100);
+  }
 
   const size_t substring = t.find(q);
   if (substring != std::wstring::npos) {
@@ -136,6 +153,9 @@ inline double ScoreItem(const std::wstring& query, const SearchItem& item, const
   else if (name.rfind(q, 0) == 0) total += 1200;
 
   if (recentIds.contains(item.id) || recentIds.contains(item.path)) total += 260;
+  if (item.pinned) total += 1000;
+  total += std::min(item.usageCount, 20) * 35;
+  if (item.lastUsed > 0) total += 150;
   if (item.kind == L"window") total += 120;
   if (item.source == L"alias") total += 90;
   if (item.systemEssential) total += 70;
