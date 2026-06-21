@@ -39,6 +39,20 @@ class ExtensionManager {
     StartQueryWorker();
   }
 
+  void OnBackground() {
+    {
+      std::lock_guard cacheLock(cacheMutex_);
+      cache_.clear();
+    }
+    {
+      std::lock_guard pluginsLock(pluginsMutex_);
+      for (const auto& plugin : plugins_) {
+        std::lock_guard ioLock(plugin->ioMutex);
+        StopProcess(*plugin);
+      }
+    }
+  }
+
   void Shutdown() {
     {
       std::lock_guard lock(queryMutex_);

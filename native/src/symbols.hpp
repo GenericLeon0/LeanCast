@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <mutex>
 
 namespace leancast::symbols {
 
@@ -77,6 +78,17 @@ inline const std::vector<Symbol>& AllSymbols() {
   return kSymbols;
 }
 
+inline std::vector<leancast::core::SearchItem>* g_SymbolsSearchItems = nullptr;
+inline std::mutex g_SymbolsMutex;
+
+inline void FreeSymbolsMemory() {
+  std::lock_guard<std::mutex> lock(g_SymbolsMutex);
+  if (g_SymbolsSearchItems) {
+    delete g_SymbolsSearchItems;
+    g_SymbolsSearchItems = nullptr;
+  }
+}
+
 inline std::vector<Symbol> SearchSymbols(std::wstring query, size_t limit = 32) {
   query = leancast::core::Trim(std::move(query));
   if (!query.empty() && query.front() == L':') {
@@ -94,20 +106,23 @@ inline std::vector<Symbol> SearchSymbols(std::wstring query, size_t limit = 32) 
     return out;
   }
 
-  std::vector<leancast::core::SearchItem> items;
-  items.reserve(all.size());
-  for (size_t i = 0; i < all.size(); ++i) {
-    leancast::core::SearchItem item;
-    item.id = std::to_wstring(i);
-    item.kind = L"symbol";
-    item.source = L"symbol";
-    item.name = all[i].label;
-    item.keywords = all[i].keywords;
-    item.keywords.push_back(all[i].value);
-    items.push_back(std::move(item));
+  std::lock_guard<std::mutex> lock(g_SymbolsMutex);
+  if (!g_SymbolsSearchItems) {
+    g_SymbolsSearchItems = new std::vector<leancast::core::SearchItem>();
+    g_SymbolsSearchItems->reserve(all.size());
+    for (size_t i = 0; i < all.size(); ++i) {
+      leancast::core::SearchItem item;
+      item.id = std::to_wstring(i);
+      item.kind = L"symbol";
+      item.source = L"symbol";
+      item.name = all[i].label;
+      item.keywords = all[i].keywords;
+      item.keywords.push_back(all[i].value);
+      g_SymbolsSearchItems->push_back(std::move(item));
+    }
   }
 
-  const auto order = leancast::core::Search(query, items);
+  const auto order = leancast::core::Search(query, *g_SymbolsSearchItems);
   for (const auto index : order) {
     out.push_back(all[index]);
     if (out.size() >= limit) break;

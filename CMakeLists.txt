@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "LeanCast Native is a Windows-only Win32 application.")
 endif()
 
-project(LeanCastNative VERSION 0.4.0 LANGUAGES C CXX RC)
+project(LeanCastNative VERSION 0.4.3 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

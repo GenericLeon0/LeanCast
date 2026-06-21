@@ -71,20 +71,47 @@ $header = @"
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <mutex>
 
 namespace leancast::emoji {
 
+inline std::vector<leancast::symbols::Symbol>* g_EmojiList = nullptr;
+inline std::vector<leancast::core::SearchItem>* g_EmojiSearchItems = nullptr;
+inline std::mutex g_EmojiMutex;
+
+inline const std::vector<leancast::symbols::Symbol>& AllEmojiUnlocked();
+
 inline const std::vector<leancast::symbols::Symbol>& AllEmoji() {
-  static const std::vector<leancast::symbols::Symbol> kEmoji = {
+  std::lock_guard<std::mutex> lock(g_EmojiMutex);
+  return AllEmojiUnlocked();
+}
+
+inline void FreeEmojiMemory() {
+  std::lock_guard<std::mutex> lock(g_EmojiMutex);
+  if (g_EmojiList) {
+    delete g_EmojiList;
+    g_EmojiList = nullptr;
+  }
+  if (g_EmojiSearchItems) {
+    delete g_EmojiSearchItems;
+    g_EmojiSearchItems = nullptr;
+  }
+}
+
+inline const std::vector<leancast::symbols::Symbol>& AllEmojiUnlocked() {
+  if (!g_EmojiList) {
+    g_EmojiList = new std::vector<leancast::symbols::Symbol>{
 $($entries -join "`n")
   };
-  return kEmoji;
+  }
+  return *g_EmojiList;
 }
 
 inline std::vector<leancast::symbols::Symbol> SearchEmoji(std::wstring query, size_t limit = 300) {
   query = leancast::core::Trim(std::move(query));
 
-  const auto& all = AllEmoji();
+  std::lock_guard<std::mutex> lock(g_EmojiMutex);
+  const auto& all = AllEmojiUnlocked();
   std::vector<leancast::symbols::Symbol> out;
   if (query.empty()) {
     for (const auto& emoji : all) {
@@ -94,19 +121,21 @@ inline std::vector<leancast::symbols::Symbol> SearchEmoji(std::wstring query, si
     return out;
   }
 
-  std::vector<leancast::core::SearchItem> items;
-  items.reserve(all.size());
-  for (size_t i = 0; i < all.size(); ++i) {
-    leancast::core::SearchItem item;
-    item.id = std::to_wstring(i);
-    item.kind = L"emoji";
-    item.source = L"emoji";
-    item.name = all[i].label;
-    item.keywords = all[i].keywords;
-    items.push_back(std::move(item));
+  if (!g_EmojiSearchItems) {
+    g_EmojiSearchItems = new std::vector<leancast::core::SearchItem>();
+    g_EmojiSearchItems->reserve(all.size());
+    for (size_t i = 0; i < all.size(); ++i) {
+      leancast::core::SearchItem item;
+      item.id = std::to_wstring(i);
+      item.kind = L"emoji";
+      item.source = L"emoji";
+      item.name = all[i].label;
+      item.keywords = all[i].keywords;
+      g_EmojiSearchItems->push_back(std::move(item));
+    }
   }
 
-  const auto order = leancast::core::Search(query, items);
+  const auto order = leancast::core::Search(query, *g_EmojiSearchItems);
   for (const auto index : order) {
     out.push_back(all[index]);
     if (out.size() >= limit) break;

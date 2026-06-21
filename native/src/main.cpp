@@ -13,6 +13,7 @@
 #include "version.hpp"
 
 #include <windows.h>
+#include <malloc.h>
 #include <cmath>
 #include <windowsx.h>
 #include <commdlg.h>
@@ -85,6 +86,7 @@ constexpr UINT WM_SEARCH_READY = WM_APP + 5;
 constexpr UINT WM_SHORTCUT_TOGGLE = WM_APP + 6;
 constexpr UINT WM_UPDATE_READY = WM_APP + 7;
 constexpr int HOTKEY_OPEN_SEARCH = 0x4C43;
+constexpr UINT TIMER_MEM_TRIM = 3;
 
 constexpr int WIN_WIDTH = 720;
 constexpr int WIN_HEIGHT = 470;
@@ -2008,6 +2010,8 @@ class LeanCastApp {
 
     if (cmdLine_.find(L"--show") != std::wstring::npos) {
       ShowOverlay(View::Search);
+    } else {
+      UpdateBackgroundState();
     }
 
     MSG msg{};
@@ -2094,6 +2098,9 @@ class LeanCastApp {
         } else if (wParam == 2) {
           if (visible_ && animating_) InvalidateRect(hwnd_, nullptr, FALSE);
           else KillTimer(hwnd_, 2);
+        } else if (wParam == TIMER_MEM_TRIM) {
+          KillTimer(hwnd_, TIMER_MEM_TRIM);
+          SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
         }
         return 0;
       case WM_CREATE:
@@ -2129,6 +2136,17 @@ class LeanCastApp {
         }
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
+      case WM_DPICHANGED: {
+        auto prc = reinterpret_cast<const RECT*>(lParam);
+        SetWindowPos(hwnd, nullptr, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (renderTarget_) {
+          float dpi = static_cast<float>(LOWORD(wParam));
+          renderTarget_->SetDpi(dpi, dpi);
+        }
+        ApplyRoundedRegion(prc->right - prc->left, prc->bottom - prc->top);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
       case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE && visible_ && !suppressHide_) HideOverlay(false);
         return 0;
@@ -2147,9 +2165,11 @@ class LeanCastApp {
       case WM_SYSCHAR:
         if (AltGrPressedForTextInput()) OnChar(static_cast<wchar_t>(wParam));
         return 0;
-      case WM_MOUSEMOVE:
-        OnMouseMove(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+      case WM_MOUSEMOVE: {
+        const float scale = GetWindowScale(hwnd_);
+        OnMouseMove(static_cast<float>(GET_X_LPARAM(lParam)) / scale, static_cast<float>(GET_Y_LPARAM(lParam)) / scale);
         return 0;
+      }
       case WM_MOUSELEAVE:
         mouseTracking_ = false;
         if (gearHovered_) {
@@ -2157,9 +2177,11 @@ class LeanCastApp {
           InvalidateRect(hwnd_, nullptr, FALSE);
         }
         return 0;
-      case WM_LBUTTONDOWN:
-        OnClick(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+      case WM_LBUTTONDOWN: {
+        const float scale = GetWindowScale(hwnd_);
+        OnClick(static_cast<float>(GET_X_LPARAM(lParam)) / scale, static_cast<float>(GET_Y_LPARAM(lParam)) / scale);
         return 0;
+      }
       case WM_MOUSEWHEEL:
         OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam));
         return 0;
@@ -2212,21 +2234,40 @@ class LeanCastApp {
         }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
+      case WM_DPICHANGED: {
+        auto prc = reinterpret_cast<const RECT*>(lParam);
+        SetWindowPos(hwnd, nullptr, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (settingsRenderTarget_) {
+          float dpi = static_cast<float>(LOWORD(wParam));
+          settingsRenderTarget_->SetDpi(dpi, dpi);
+        }
+        const float scale = static_cast<float>(LOWORD(wParam)) / 96.0f;
+        const int settingsRound = static_cast<int>(theme_.settingsRadius * scale);
+        SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, prc->right - prc->left + 1, prc->bottom - prc->top + 1, settingsRound, settingsRound), TRUE);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
       case WM_NCHITTEST: {
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ScreenToClient(hwnd, &pt);
+        const float scale = GetWindowScale(hwnd);
+        const float lx = static_cast<float>(pt.x) / scale;
+        const float ly = static_cast<float>(pt.y) / scale;
         RECT rc{};
         GetClientRect(hwnd, &rc);
-        const bool overClose = pt.x >= rc.right - 46 && pt.x <= rc.right - 14 && pt.y >= 12 && pt.y <= 44;
-        if (pt.y >= 0 && pt.y < 52 && !overClose) return HTCAPTION;
+        const float lwidth = static_cast<float>(rc.right - rc.left) / scale;
+        const bool overClose = lx >= lwidth - 46.0f && lx <= lwidth - 14.0f && ly >= 12.0f && ly <= 44.0f;
+        if (ly >= 0.0f && ly < 52.0f && !overClose) return HTCAPTION;
         return HTCLIENT;
       }
       case WM_KEYDOWN:
         if (wParam == VK_ESCAPE && !recording_) HideSettings();
         return 0;
-      case WM_MOUSEMOVE:
-        OnSettingsMouseMove(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+      case WM_MOUSEMOVE: {
+        const float scale = GetWindowScale(hwnd);
+        OnSettingsMouseMove(static_cast<float>(GET_X_LPARAM(lParam)) / scale, static_cast<float>(GET_Y_LPARAM(lParam)) / scale);
         return 0;
+      }
       case WM_MOUSELEAVE:
         mouseTracking_ = false;
         if (settingsHover_ != -1) {
@@ -2234,9 +2275,11 @@ class LeanCastApp {
           InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
-      case WM_LBUTTONDOWN:
-        OnSettingsClick(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+      case WM_LBUTTONDOWN: {
+        const float scale = GetWindowScale(hwnd);
+        OnSettingsClick(static_cast<float>(GET_X_LPARAM(lParam)) / scale, static_cast<float>(GET_Y_LPARAM(lParam)) / scale);
         return 0;
+      }
       case WM_CLOSE:
         HideSettings();
         return 0;
@@ -2316,8 +2359,9 @@ class LeanCastApp {
     if (renderTarget_ || !d2dFactory_) return;
     RECT rc{};
     GetClientRect(hwnd_, &rc);
+    const float dpi = GetWindowScale(hwnd_) * 96.0f;
     d2dFactory_->CreateHwndRenderTarget(
-      D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED), 96, 96),
+      D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi),
       D2D1::HwndRenderTargetProperties(hwnd_, D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
       renderTarget_.GetAddressOf());
 
@@ -2328,8 +2372,9 @@ class LeanCastApp {
     if (settingsRenderTarget_ || !d2dFactory_) return;
     RECT rc{};
     GetClientRect(settingsHwnd_, &rc);
+    const float dpi = GetWindowScale(settingsHwnd_) * 96.0f;
     d2dFactory_->CreateHwndRenderTarget(
-      D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED), 96, 96),
+      D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi),
       D2D1::HwndRenderTargetProperties(settingsHwnd_, D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
       settingsRenderTarget_.GetAddressOf());
 
@@ -3541,6 +3586,73 @@ class LeanCastApp {
     return mi;
   }
 
+  void UpdateBackgroundState() {
+    bool isForeground = visible_ || (settingsHwnd_ && IsWindowVisible(settingsHwnd_));
+    if (isForeground) {
+      KillTimer(hwnd_, TIMER_MEM_TRIM);
+      SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+
+      MEMORY_PRIORITY_INFORMATION memPriority{};
+      memPriority.MemoryPriority = MEMORY_PRIORITY_NORMAL;
+      SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &memPriority, sizeof(memPriority));
+
+      PROCESS_POWER_THROTTLING_STATE powerThrottling{};
+      powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+      powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+      powerThrottling.StateMask = 0;
+      SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &powerThrottling, sizeof(powerThrottling));
+    } else {
+      // Immediately free heavyweight Direct2D resources and in-memory caches
+      renderTarget_.Reset();
+      settingsRenderTarget_.Reset();
+      ClearIconBitmaps();
+      brushCache_.clear();
+
+      // Background Memory Optimization:
+      
+      // 1. Release query-independent search corpus snapshot
+      snapshot_ = nullptr;
+      snapshotDirty_ = true;
+
+      // 2. Reclaim query-dependent result lists
+      latestResult_ = ResultsCollection{};
+      sections_.clear();
+      sections_.shrink_to_fit();
+      flatItems_.clear();
+      flatItems_.shrink_to_fit();
+      hits_.clear();
+      hits_.shrink_to_fit();
+
+      // 3. Clear extension caches and terminate background plugin processes
+      extensions_.OnBackground();
+
+      // 4. Free lazy-loaded emoji and symbols memory lists & caches
+      leancast::emoji::FreeEmojiMemory();
+      leancast::symbols::FreeSymbolsMemory();
+
+      // Minimize CRT heap fragmentation and decommit unused pages back to the OS
+      _heapmin();
+
+      // Lower scheduling priority class
+      SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+
+      // Set low memory priority class
+      MEMORY_PRIORITY_INFORMATION memPriority{};
+      memPriority.MemoryPriority = MEMORY_PRIORITY_VERY_LOW;
+      SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &memPriority, sizeof(memPriority));
+
+      // Enable EcoQoS (Power Throttling)
+      PROCESS_POWER_THROTTLING_STATE powerThrottling{};
+      powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+      powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+      powerThrottling.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+      SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &powerThrottling, sizeof(powerThrottling));
+
+      // Schedule deferred working set empty (10 seconds delay) to prevent page-fault storms
+      SetTimer(hwnd_, TIMER_MEM_TRIM, 10000, nullptr);
+    }
+  }
+
   void ShowOverlay(View view) {
     view_ = view;
     HWND foreground = GetForegroundWindow();
@@ -3583,6 +3695,7 @@ class LeanCastApp {
 
     SetTimer(hwnd_, 1, 200, nullptr);
     visible_ = true;
+    UpdateBackgroundState();
     animating_ = settings_.animationsEnabled;
     if (animating_) {
       animStart_ = GetTickCount64();
@@ -3598,6 +3711,7 @@ class LeanCastApp {
     visible_ = false;
     ShowWindow(hwnd_, SW_HIDE);
     overlayMonitor_ = nullptr;
+    UpdateBackgroundState();
     if (restoreFocus && lastActiveWindow_) {
       FocusWindow(lastActiveWindow_);
       lastActiveWindow_ = nullptr;
@@ -3627,33 +3741,37 @@ class LeanCastApp {
 
   void ShowSettingsWindow() {
     if (!settingsHwnd_) return;
-    const int width = SETTINGS_WIDTH;
-    const int height = SettingsContentHeight();
-
     POINT cursor{};
     GetCursorPos(&cursor);
     HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    const float scale = GetMonitorScale(monitor);
+
+    const int width = static_cast<int>(SETTINGS_WIDTH * scale);
+    const int height = static_cast<int>(SettingsContentHeight() * scale);
+
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(monitor, &mi);
-    const int maxHeight = mi.rcWork.bottom - mi.rcWork.top - 40;
+    const int maxHeight = mi.rcWork.bottom - mi.rcWork.top - static_cast<int>(40 * scale);
     const int clamped = std::min(height, maxHeight);
     const int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - width) / 2;
     const int yPos = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - clamped) / 2;
 
     SetWindowPos(settingsHwnd_, HWND_TOPMOST, x, yPos, width, clamped, SWP_NOACTIVATE);
-    const int settingsRound = static_cast<int>(theme_.settingsRadius);
+    const int settingsRound = static_cast<int>(theme_.settingsRadius * scale);
     SetWindowRgn(settingsHwnd_, CreateRoundRectRgn(0, 0, width + 1, clamped + 1, settingsRound, settingsRound), TRUE);
     ShowWindow(settingsHwnd_, SW_SHOW);
     SetForegroundWindow(settingsHwnd_);
     SetActiveWindow(settingsHwnd_);
     SetFocus(settingsHwnd_);
     InvalidateRect(settingsHwnd_, nullptr, FALSE);
+    UpdateBackgroundState();
   }
 
   void HideSettings() {
     recording_ = false;
     shortcutRecorder_.Reset();
     if (settingsHwnd_) ShowWindow(settingsHwnd_, SW_HIDE);
+    UpdateBackgroundState();
   }
 
   void EnterActionMode(const DisplayItem& target) {
@@ -3723,7 +3841,8 @@ class LeanCastApp {
 
     RECT rc{};
     GetClientRect(hwnd_, &rc);
-    const float width = static_cast<float>(rc.right - rc.left);
+    const float scale = GetWindowScale(hwnd_);
+    const float width = static_cast<float>(rc.right - rc.left) / scale;
     const float textLeft = 52.0f;
     const float textWidth = std::max(1.0f, width - 94.0f - textLeft);
     if (x <= textLeft) {
@@ -3757,10 +3876,42 @@ class LeanCastApp {
     }
   }
 
+  float GetWindowScale(HWND hwnd) const {
+    UINT dpi = 96;
+    typedef UINT(WINAPI* GetDpiForWindowProc)(HWND);
+    if (HMODULE hUser32 = GetModuleHandleW(L"user32.dll")) {
+      if (auto proc = reinterpret_cast<GetDpiForWindowProc>(GetProcAddress(hUser32, "GetDpiForWindow"))) {
+        dpi = proc(hwnd);
+      }
+    }
+    return dpi > 0 ? static_cast<float>(dpi) / 96.0f : 1.0f;
+  }
+
+  float GetMonitorScale(HMONITOR hMonitor) const {
+    UINT dpiX = 96;
+    UINT dpiY = 96;
+    typedef HRESULT(WINAPI* GetDpiForMonitorProc)(HMONITOR, int, UINT*, UINT*);
+    if (HMODULE hShcore = GetModuleHandleW(L"shcore.dll")) {
+      if (auto proc = reinterpret_cast<GetDpiForMonitorProc>(GetProcAddress(hShcore, "GetDpiForMonitor"))) {
+        proc(hMonitor, 0 /*MDT_EFFECTIVE_DPI*/, &dpiX, &dpiY);
+      }
+    } else if (HMODULE hShcoreLoad = LoadLibraryW(L"shcore.dll")) {
+      if (auto proc = reinterpret_cast<GetDpiForMonitorProc>(GetProcAddress(hShcoreLoad, "GetDpiForMonitor"))) {
+        proc(hMonitor, 0 /*MDT_EFFECTIVE_DPI*/, &dpiX, &dpiY);
+      }
+      FreeLibrary(hShcoreLoad);
+    }
+    return dpiX > 0 ? static_cast<float>(dpiX) / 96.0f : 1.0f;
+  }
+
   void PositionWindow() {
     const MONITORINFO mi = OverlayMonitorInfo();
-    const int width = OverlayWidth();
-    const int height = CurrentHeight();
+    HMONITOR monitor = overlayMonitor_;
+    if (!monitor) monitor = ResolveOverlayMonitor(GetForegroundWindow());
+    const float scale = GetMonitorScale(monitor);
+
+    const int width = static_cast<int>(OverlayWidth() * scale);
+    const int height = static_cast<int>(CurrentHeight() * scale);
     const int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - width) / 2;
     const int y = mi.rcWork.top + static_cast<int>((mi.rcWork.bottom - mi.rcWork.top) * 0.22);
     SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
@@ -3784,8 +3935,9 @@ class LeanCastApp {
   }
 
   void ApplyWindowSize() {
-    const int height = CurrentHeight();
-    const int width = OverlayWidth();
+    const float scale = GetWindowScale(hwnd_);
+    const int height = static_cast<int>(CurrentHeight() * scale);
+    const int width = static_cast<int>(OverlayWidth() * scale);
     RECT rc{};
     GetWindowRect(hwnd_, &rc);
     const int currentWidth = rc.right - rc.left;
@@ -3806,7 +3958,8 @@ class LeanCastApp {
       SetWindowRgn(hwnd_, nullptr, TRUE);
       return;
     }
-    const int round = static_cast<int>(theme_.overlayRadius);
+    const float scale = GetWindowScale(hwnd_);
+    const int round = static_cast<int>(theme_.overlayRadius * scale);
     HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, round, round);
     SetWindowRgn(hwnd_, region, TRUE);
   }
@@ -3991,8 +4144,9 @@ class LeanCastApp {
   void DrawSearch() {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
-    const float width = static_cast<float>(rc.right - rc.left);
-    const float height = static_cast<float>(rc.bottom - rc.top);
+    const float scale = GetWindowScale(hwnd_);
+    const float width = static_cast<float>(rc.right - rc.left) / scale;
+    const float height = static_cast<float>(rc.bottom - rc.top) / scale;
     const COLORREF accent = ActiveAccent();
     const COLORREF bg = ColorRefFromTheme(theme_.selectedBase);
 
@@ -4273,8 +4427,9 @@ class LeanCastApp {
   void DrawSettings() {
     RECT rc{};
     GetClientRect(settingsHwnd_, &rc);
-    const float width = static_cast<float>(rc.right - rc.left);
-    const float height = static_cast<float>(rc.bottom - rc.top);
+    const float scale = GetWindowScale(settingsHwnd_);
+    const float width = static_cast<float>(rc.right - rc.left) / scale;
+    const float height = static_cast<float>(rc.bottom - rc.top) / scale;
     const COLORREF accent = ActiveAccent();
 
     FillRound({0, 0, width, height}, theme_.settingsRadius, D2DColor(theme_.settingsBackground));
@@ -4722,7 +4877,8 @@ class LeanCastApp {
           const int rowBottom = y + 48;
           RECT rc{};
           GetClientRect(hwnd_, &rc);
-          const int visible = (rc.bottom - rc.top) - 60 - (settings_.compactMode ? 0 : 36);
+          const float scale = GetWindowScale(hwnd_);
+          const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - 60 - (settings_.compactMode ? 0 : 36);
           if (rowTop - scroll_ < 0) scroll_ = rowTop;
           else if (rowBottom - scroll_ > visible) scroll_ = rowBottom - visible;
           scroll_ = std::max(0, scroll_);
@@ -4807,7 +4963,8 @@ class LeanCastApp {
     if (view_ == View::Search) {
       RECT rc{};
       GetClientRect(hwnd_, &rc);
-      const float width = static_cast<float>(rc.right - rc.left);
+      const float scale = GetWindowScale(hwnd_);
+      const float width = static_cast<float>(rc.right - rc.left) / scale;
       if (PointInRect({0, 0, width - 60.0f, 60.0f}, x, y)) {
         SetCaretFromSearchClick(x);
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -4832,15 +4989,17 @@ class LeanCastApp {
     if (!settingsHwnd_ || !IsWindowVisible(settingsHwnd_)) return;
     RECT rc{};
     GetWindowRect(settingsHwnd_, &rc);
-    const int width = SETTINGS_WIDTH;
+    const float scale = GetWindowScale(settingsHwnd_);
+    const int width = static_cast<int>(SETTINGS_WIDTH * scale);
     int height = SettingsContentHeight();
     HMONITOR monitor = MonitorFromWindow(settingsHwnd_, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(monitor, &mi);
-    height = std::min(height, static_cast<int>(mi.rcWork.bottom - mi.rcWork.top - 40));
-    SetWindowPos(settingsHwnd_, HWND_TOPMOST, rc.left, rc.top, width, height, SWP_NOACTIVATE);
-    const int settingsRound = static_cast<int>(theme_.settingsRadius);
-    SetWindowRgn(settingsHwnd_, CreateRoundRectRgn(0, 0, width + 1, height + 1, settingsRound, settingsRound), TRUE);
+    height = std::min(height, static_cast<int>((mi.rcWork.bottom - mi.rcWork.top - 40) / scale));
+    const int physicalHeight = static_cast<int>(height * scale);
+    SetWindowPos(settingsHwnd_, HWND_TOPMOST, rc.left, rc.top, width, physicalHeight, SWP_NOACTIVATE);
+    const int settingsRound = static_cast<int>(theme_.settingsRadius * scale);
+    SetWindowRgn(settingsHwnd_, CreateRoundRectRgn(0, 0, width + 1, physicalHeight + 1, settingsRound, settingsRound), TRUE);
   }
 
   void HandleSettingsHit(HitType type) {
@@ -4949,7 +5108,8 @@ class LeanCastApp {
     scroll_ -= delta / WHEEL_DELTA * 72;
     RECT rc{};
     GetClientRect(hwnd_, &rc);
-    const int visible = (rc.bottom - rc.top) - 60 - (settings_.compactMode ? 0 : 36);
+    const float scale = GetWindowScale(hwnd_);
+    const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - 60 - (settings_.compactMode ? 0 : 36);
     scroll_ = std::clamp(scroll_, 0, std::max(0, ResultsContentHeight() - visible));
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
