@@ -171,15 +171,85 @@ inline bool IsConnector(const std::wstring& token) {
   return token == L"to" || token == L"in" || token == L"into" || token == L"as";
 }
 
-// Parses "<number> <fromUnit> [to|in|into|as] <toUnit>" and converts. Returns
-// nullopt for anything that is not a recognized cross-unit/currency conversion,
-// leaving plain arithmetic to the calculator.
-inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::wstring, double>& rates = {}) {
+// True when the token begins with a parseable number (e.g. "5", "-3.2", "10km").
+inline bool LeadingNumber(const std::wstring& token) {
+  if (token.empty()) return false;
+  const wchar_t* begin = token.c_str();
+  wchar_t* end = nullptr;
+  std::wcstod(begin, &end);
+  return end != begin;
+}
+
+// Common single-character currency symbols mapped to their ISO-4217 code. Both
+// keys and codes are written with \u escapes so the source stays
+// encoding-independent. Symbols like "$" are inherently ambiguous; we pick the
+// most common interpretation.
+inline const std::map<wchar_t, std::wstring>& CurrencySymbols() {
+  static const std::map<wchar_t, std::wstring> table = {
+      {L'$', L"USD"},        // dollar
+      {L'\u20AC', L"EUR"},   // euro
+      {L'\u00A3', L"GBP"},   // pound
+      {L'\u00A5', L"JPY"},   // yen
+      {L'\u20B9', L"INR"},   // rupee
+      {L'\u20A9', L"KRW"},   // won
+      {L'\u20BD', L"RUB"},   // ruble
+      {L'\u20BA', L"TRY"},   // lira
+      {L'\u20AA', L"ILS"},   // shekel
+      {L'\u0E3F', L"THB"},   // baht
+  };
+  return table;
+}
+
+// Replaces currency symbols with their spaced ISO code so "$5" becomes " USD 5",
+// letting the regular tokenizer/parser take over.
+inline std::wstring ExpandCurrencySymbols(const std::wstring& text) {
+  const auto& symbols = CurrencySymbols();
+  std::wstring out;
+  out.reserve(text.size());
+  for (const wchar_t ch : text) {
+    if (const auto it = symbols.find(ch); it != symbols.end()) {
+      out.push_back(L' ');
+      out += it->second;
+      out.push_back(L' ');
+    } else {
+      out.push_back(ch);
+    }
+  }
+  return out;
+}
+
+// Parses "<number> <fromUnit> [to|in|into|as] <toUnit>" and converts. Also
+// accepts a currency-first amount ("USD 5"), "=" as a connector ("USD 5 = GBP"),
+// and a lone currency ("USD 5") which converts to defaultCurrency when supplied.
+// Returns nullopt for anything that is not a recognized cross-unit/currency
+// conversion, leaving plain arithmetic to the calculator.
+inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::wstring, double>& rates = {},
+                                        const std::wstring& defaultCurrency = L"") {
   const std::wstring original = Trim(std::move(input));
   if (original.empty()) return std::nullopt;
 
+  // Normalize the query so the existing number-first parser can handle it, while
+  // keeping `original` intact for display. Expand currency symbols ("$" -> "USD"),
+  // treat "=" as a connector, then swap a leading "<currency> <number>" into
+  // "<number> <currency>".
+  std::wstring normalized = ExpandCurrencySymbols(original);
+  for (size_t pos; (pos = normalized.find(L'=')) != std::wstring::npos;) {
+    normalized.replace(pos, 1, L" to ");
+  }
+  {
+    std::vector<std::wstring> head = SplitTokens(normalized);
+    if (head.size() >= 2 && !LeadingNumber(head[0]) && LeadingNumber(head[1])) {
+      std::swap(head[0], head[1]);
+      normalized.clear();
+      for (size_t i = 0; i < head.size(); ++i) {
+        if (i) normalized.push_back(L' ');
+        normalized += head[i];
+      }
+    }
+  }
+
   // Parse the leading numeric amount.
-  const wchar_t* begin = original.c_str();
+  const wchar_t* begin = normalized.c_str();
   wchar_t* numberEnd = nullptr;
   const double amount = std::wcstod(begin, &numberEnd);
   if (numberEnd == begin || !std::isfinite(amount)) return std::nullopt;
@@ -198,7 +268,14 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   const std::vector<std::wstring> tokens = SplitTokens(remainder);
   std::wstring fromToken;
   std::wstring toToken;
-  if (tokens.size() == 2) {
+  if (tokens.size() == 1) {
+    // A lone currency ("5 USD") converts to the caller's locale currency, unless
+    // they are the same (which would be a pointless "5 EUR = 5 EUR").
+    if (!defaultCurrency.empty() && Upper(tokens[0]) != Upper(defaultCurrency)) {
+      fromToken = tokens[0];
+      toToken = defaultCurrency;
+    }
+  } else if (tokens.size() == 2) {
     fromToken = tokens[0];
     toToken = tokens[1];
   } else if (tokens.size() >= 3) {

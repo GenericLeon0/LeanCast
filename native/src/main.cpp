@@ -85,6 +85,7 @@ constexpr UINT WM_REBUILD_RESULTS = WM_APP + 4;
 constexpr UINT WM_SEARCH_READY = WM_APP + 5;
 constexpr UINT WM_SHORTCUT_TOGGLE = WM_APP + 6;
 constexpr UINT WM_UPDATE_READY = WM_APP + 7;
+constexpr UINT WM_TRACK_RECENT = WM_APP + 8;
 constexpr int HOTKEY_OPEN_SEARCH = 0x4C43;
 constexpr UINT TIMER_MEM_TRIM = 3;
 
@@ -466,6 +467,7 @@ struct QueryRequest {
   std::set<std::wstring> recentIds;
   std::map<std::wstring, std::wstring> searchEngines;   // web search prefixes
   std::map<std::wstring, double> currencyRates;          // code -> rate per USD
+  std::wstring defaultCurrency;                          // locale currency for "USD 5"
 
   // Cached, query-independent corpus shared across keystrokes.
   std::shared_ptr<const SearchSnapshot> snapshot;
@@ -506,6 +508,22 @@ std::wstring Lower(std::wstring value) {
 
 std::wstring Trim(std::wstring value) {
   return leancast::core::Trim(std::move(value));
+}
+
+// The user's locale currency as an ISO-4217 code (e.g. "EUR"), used as the
+// default conversion target for queries like "USD 5". Falls back to USD.
+std::wstring DetectLocaleCurrency() {
+  wchar_t buffer[16] = {};
+  if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SINTLSYMBOL, buffer,
+                      static_cast<int>(std::size(buffer))) > 0) {
+    std::wstring code = Trim(buffer);
+    if (code.size() >= 3) {
+      code = code.substr(0, 3);
+      for (auto& ch : code) ch = static_cast<wchar_t>(std::towupper(ch));
+      return code;
+    }
+  }
+  return L"USD";
 }
 
 bool StartsWith(const std::wstring& value, const std::wstring& prefix) {
@@ -944,6 +962,25 @@ std::filesystem::path UserDataPath() {
   std::error_code ec;
   std::filesystem::create_directories(root, ec);
   return root;
+}
+
+// TEMP DEBUG helpers: diagnose why some apps fail to launch. Remove once fixed.
+std::wstring ToHex(unsigned value) {
+  wchar_t buf[16]{};
+  swprintf_s(buf, L"%08X", value);
+  return buf;
+}
+
+// TEMP DEBUG: append a line to %APPDATA%\LeanCast\launch-debug.log to diagnose
+// why some apps fail to launch. Remove once the launch bug is understood.
+void DebugLaunchLog(const std::wstring& line) {
+  std::wofstream f(UserDataPath() / L"launch-debug.log", std::ios::app);
+  if (!f) return;
+  SYSTEMTIME st{};
+  GetLocalTime(&st);
+  wchar_t ts[32]{};
+  swprintf_s(ts, L"%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+  f << ts << line << L"\n";
 }
 
 std::filesystem::path LocalDataPath() {
@@ -1431,8 +1468,26 @@ std::optional<std::string> HttpsGet(const std::wstring& host, const std::wstring
   if (!request) return result;
   ScopeExit closeRequest([&] { WinHttpCloseHandle(request); });
 
+  // The GitHub REST API requires an Accept header and a pinned API version; the
+  // User-Agent is already supplied via WinHttpOpen above.
+  static constexpr wchar_t kGitHubHeaders[] =
+      L"Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28";
+  WinHttpAddRequestHeaders(request, kGitHubHeaders, static_cast<DWORD>(-1),
+                           WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+
   if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
       !WinHttpReceiveResponse(request, nullptr)) {
+    return result;
+  }
+
+  // Treat any non-2xx response (e.g. 403 rate limit, 404 missing release) as a
+  // reachability failure so the caller surfaces a clear network error instead of
+  // trying to parse an error payload as release metadata.
+  DWORD status = 0;
+  DWORD statusSize = sizeof(status);
+  if (WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                          WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX) &&
+      (status < 200 || status >= 300)) {
     return result;
   }
 
@@ -2214,6 +2269,14 @@ class LeanCastApp {
         }
         return 0;
       }
+      case WM_TRACK_RECENT: {
+        auto* pId = reinterpret_cast<std::wstring*>(lParam);
+        if (pId) {
+          TrackRecent(*pId);
+          delete pId;
+        }
+        return 0;
+      }
       case WM_UPDATE_READY:
         OnUpdateReady();
         return 0;
@@ -2268,6 +2331,9 @@ class LeanCastApp {
         OnSettingsMouseMove(static_cast<float>(GET_X_LPARAM(lParam)) / scale, static_cast<float>(GET_Y_LPARAM(lParam)) / scale);
         return 0;
       }
+      case WM_MOUSEWHEEL:
+        OnSettingsMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam));
+        return 0;
       case WM_MOUSELEAVE:
         mouseTracking_ = false;
         if (settingsHover_ != -1) {
@@ -3011,19 +3077,16 @@ class LeanCastApp {
             entry.systemEssential = IsSystemEssentialName(name);
             entry.keywords = KeywordsFor(name, terminalAlias, appId);
 
-            if (!terminalAlias.empty()) {
-              entry.source = L"alias";
-              entry.launchType = LaunchType::Exe;
-              entry.launchTarget = terminalAlias;
-              entry.targetPath = terminalAlias;
-              entry.adminSupported = true;
-              entry.systemEssential = true;
-            } else {
-              entry.source = appId.find(L"!") != std::wstring::npos ? L"appx" : L"start";
-              entry.launchType = LaunchType::AppsFolder;
-              entry.launchTarget = appId;
-              entry.adminSupported = false;
-            }
+            entry.source = appId.find(L"!") != std::wstring::npos ? L"appx" : L"start";
+            entry.launchType = LaunchType::AppsFolder;
+            entry.launchTarget = appId;
+            // Keep the execution alias (e.g. wt.exe) so the app can still be
+            // launched elevated; normal launches go through AppsFolder
+            // activation, which reliably brings the window to the foreground
+            // instead of occasionally opening an Explorer folder.
+            entry.targetPath = terminalAlias;
+            entry.adminSupported = !terminalAlias.empty();
+            if (terminal) entry.systemEssential = true;
             out.push_back(std::move(entry));
           }
         }
@@ -3168,6 +3231,7 @@ class LeanCastApp {
       std::lock_guard lock(dataMutex_);
       req.currencyRates = currencyRates_.perUsd;
     }
+    req.defaultCurrency = localeCurrency_;
 
     if (req.compactClear) return req;
 
@@ -3368,7 +3432,7 @@ class LeanCastApp {
         addSection(L"Calculator", take({CalculatorDisplay(*calculation)}, 1));
       }
 
-      if (const auto conversion = leancast::converter::TryConvert(req.query, req.currencyRates)) {
+      if (const auto conversion = leancast::converter::TryConvert(req.query, req.currencyRates, req.defaultCurrency)) {
         addSection(L"Conversion", take({ConversionDisplay(conversion->expression, conversion->display)}, 1));
       }
 
@@ -3741,6 +3805,7 @@ class LeanCastApp {
 
   void ShowSettingsWindow() {
     if (!settingsHwnd_) return;
+    settingsScroll_ = 0.0f;
     POINT cursor{};
     GetCursorPos(&cursor);
     HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
@@ -4452,7 +4517,13 @@ class LeanCastApp {
     auto topBorder = Brush(D2DColor(theme_.border));
     activeRT_->DrawLine(D2D1::Point2F(0, 56), D2D1::Point2F(width, 56), topBorder.Get(), 1);
 
-    float y = kSettTop;
+    // Keep the scroll offset within range (e.g. after a DPI/height change) and
+    // clip the scrollable content so it never paints over the fixed title bar.
+    const float maxScroll = std::max(0.0f, static_cast<float>(SettingsContentHeight()) - height);
+    settingsScroll_ = std::clamp(settingsScroll_, 0.0f, maxScroll);
+    activeRT_->PushAxisAlignedClip(D2D1::RectF(0, 57, width, height), D2D1_ANTIALIAS_MODE_ALIASED);
+
+    float y = kSettTop - settingsScroll_;
 
     // ---- Shortcut ----
     y = DrawSettingsSection(y, L"GLOBAL SHORTCUT", width);
@@ -4537,6 +4608,19 @@ class LeanCastApp {
       DrawSettingsButton({24, btnTop, 24 + btnW, btnTop + 38}, L"Clear Recents", HitType::ClearRecents);
       DrawSettingsButton({24 + btnW + 12, btnTop, 24 + 2 * btnW + 12, btnTop + 38}, L"Clear Icon Cache", HitType::ClearIconCache);
       DrawSettingsButton({width - 24 - btnW, btnTop, width - 24, btnTop + 38}, L"Check Updates", HitType::CheckUpdates);
+    }
+
+    activeRT_->PopAxisAlignedClip();
+
+    // Scrollbar thumb, shown only when the content overflows the window.
+    if (maxScroll > 0.0f) {
+      const float trackTop = 60.0f;
+      const float trackBottom = height - 8.0f;
+      const float trackH = trackBottom - trackTop;
+      const float contentH = static_cast<float>(SettingsContentHeight());
+      const float thumbH = std::max(36.0f, trackH * (height / contentH));
+      const float thumbY = trackTop + (trackH - thumbH) * (settingsScroll_ / maxScroll);
+      FillRound({width - 7, thumbY, width - 4, thumbY + thumbH}, 1.5f, D2DColor(theme_.textDim));
     }
   }
 
@@ -5114,6 +5198,25 @@ class LeanCastApp {
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
 
+  // Largest scroll offset (logical px) so the bottom of the settings content
+  // stops flush with the window's bottom edge. Zero when everything fits.
+  float SettingsMaxScroll() const {
+    if (!settingsHwnd_) return 0.0f;
+    RECT rc{};
+    GetClientRect(settingsHwnd_, &rc);
+    const float scale = GetWindowScale(settingsHwnd_);
+    const float viewHeight = static_cast<float>(rc.bottom - rc.top) / scale;
+    return std::max(0.0f, static_cast<float>(SettingsContentHeight()) - viewHeight);
+  }
+
+  void OnSettingsMouseWheel(int delta) {
+    const float maxScroll = SettingsMaxScroll();
+    if (maxScroll <= 0.0f) return;
+    settingsScroll_ -= static_cast<float>(delta) / WHEEL_DELTA * 60.0f;
+    settingsScroll_ = std::clamp(settingsScroll_, 0.0f, maxScroll);
+    InvalidateRect(settingsHwnd_, nullptr, FALSE);
+  }
+
   void ChooseAccentColor() {
     COLORREF custom[16]{};
     CHOOSECOLORW cc{};
@@ -5156,7 +5259,21 @@ class LeanCastApp {
     }
   }
 
-  void Activate(const DisplayItem& item, bool asAdmin) {
+  void Activate(DisplayItem item, bool asAdmin) {
+    DebugLaunchLog(L"Activate: isSnippet=" + std::to_wstring(item.isSnippet) +
+                   L" isClipboard=" + std::to_wstring(item.isClipboard) +
+                   L" isSymbol=" + std::to_wstring(item.isSymbol) +
+                   L" isRunCommand=" + std::to_wstring(item.isRunCommand) +
+                   L" isCalculator=" + std::to_wstring(item.isCalculator) +
+                   L" isWebSearch=" + std::to_wstring(item.isWebSearch) +
+                   L" isExtension=" + std::to_wstring(item.isExtension) +
+                   L" isCommand=" + std::to_wstring(item.isCommand) +
+                   L" isAction=" + std::to_wstring(item.isAction) +
+                   L" isWindow=" + std::to_wstring(item.isWindow) +
+                   L" appName='" + item.app.name + L"' appId='" + item.app.id + L"'" +
+                   L" appLaunchTarget='" + item.app.launchTarget + L"'" +
+                   L" appType=" + std::to_wstring(static_cast<int>(item.app.launchType)));
+
     if (item.isSnippet) {
       PasteTextToLastActiveWindow(item.snippet.text);
       return;
@@ -5174,12 +5291,16 @@ class LeanCastApp {
 
     if (item.isRunCommand) {
       HideOverlay(false);
-      if (item.runCommand.kind == leancast::run_command::Kind::OpenTarget) {
-        ShellExecuteW(nullptr, L"open", item.runCommand.target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-      } else if (item.runCommand.kind == leancast::run_command::Kind::ShellCommand) {
-        const std::wstring args = L"/d /k " + item.runCommand.input;
-        ShellExecuteW(nullptr, L"open", L"cmd.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
-      }
+      std::jthread([runCommand = item.runCommand]() {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        if (runCommand.kind == leancast::run_command::Kind::OpenTarget) {
+          ShellExecuteW(nullptr, L"open", runCommand.target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        } else if (runCommand.kind == leancast::run_command::Kind::ShellCommand) {
+          const std::wstring args = L"/d /k " + runCommand.input;
+          ShellExecuteW(nullptr, L"open", L"cmd.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+        }
+        CoUninitialize();
+      }).detach();
       return;
     }
 
@@ -5191,7 +5312,11 @@ class LeanCastApp {
 
     if (item.isWebSearch) {
       HideOverlay(false);
-      ShellExecuteW(nullptr, L"open", item.webSearchUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      std::jthread([url = item.webSearchUrl]() {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        CoUninitialize();
+      }).detach();
       return;
     }
 
@@ -5217,8 +5342,19 @@ class LeanCastApp {
     }
 
     HideOverlay(false);
-    const bool ok = LaunchApp(item.app, asAdmin && item.app.adminSupported);
-    if (ok) TrackRecent(PrimaryAppId(item.app));
+    auto appPtr = std::make_shared<AppEntry>(item.app);
+    std::jthread([this, appPtr, asAdmin, id = PrimaryAppId(item.app)]() {
+      DebugLaunchLog(L"Lambda: name='" + appPtr->name + L"' target='" + appPtr->launchTarget + L"'");
+      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+      const bool ok = this->LaunchApp(*appPtr, asAdmin && appPtr->adminSupported);
+      if (ok) {
+        auto* pId = new std::wstring(id);
+        if (!PostMessageW(hwnd_, WM_TRACK_RECENT, 0, reinterpret_cast<LPARAM>(pId))) {
+          delete pId;
+        }
+      }
+      CoUninitialize();
+    }).detach();
   }
 
   void ExecuteCommand(CommandKind command) {
@@ -5258,7 +5394,11 @@ class LeanCastApp {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case CommandKind::OpenDataFolder:
-        ShellExecuteW(nullptr, L"open", UserDataPath().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        std::jthread([path = UserDataPath()]() {
+          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          CoUninitialize();
+        }).detach();
         HideOverlay(false);
         return;
       case CommandKind::ReloadExtensions:
@@ -5282,7 +5422,11 @@ class LeanCastApp {
         return;
       case CommandKind::OpenSnippetsFile:
         EnsureSnippetsFile();
-        ShellExecuteW(nullptr, L"open", SnippetsPath().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        std::jthread([path = SnippetsPath()]() {
+          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          CoUninitialize();
+        }).detach();
         HideOverlay(false);
         return;
       case CommandKind::ReloadSnippets:
@@ -5293,7 +5437,11 @@ class LeanCastApp {
         return;
       case CommandKind::OpenThemeFile:
         leancast::theme::WriteDefaultTheme(ThemePath());
-        ShellExecuteW(nullptr, L"open", ThemePath().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        std::jthread([path = ThemePath()]() {
+          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          CoUninitialize();
+        }).detach();
         HideOverlay(false);
         return;
       case CommandKind::ReloadTheme:
@@ -5328,7 +5476,7 @@ class LeanCastApp {
     }
   }
 
-  void ExecuteAction(const DisplayItem& item) {
+  void ExecuteAction(DisplayItem item) {
     if (item.actionTargetIsWindow) {
       HWND target = item.actionWindow.hwnd;
       if (!target || !IsWindow(target)) {
@@ -5368,8 +5516,19 @@ class LeanCastApp {
       case ActionKind::Open:
       case ActionKind::RunAsAdmin: {
         HideOverlay(false);
-        const bool ok = LaunchApp(app, item.action == ActionKind::RunAsAdmin && app.adminSupported);
-        if (ok) TrackRecent(id);
+        auto appPtr = std::make_shared<AppEntry>(app);
+        std::jthread([this, appPtr, runAsAdmin = (item.action == ActionKind::RunAsAdmin), id]() {
+          DebugLaunchLog(L"LambdaAction: name='" + appPtr->name + L"' target='" + appPtr->launchTarget + L"'");
+          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          const bool ok = this->LaunchApp(*appPtr, runAsAdmin && appPtr->adminSupported);
+          if (ok) {
+            auto* pId = new std::wstring(id);
+            if (!PostMessageW(hwnd_, WM_TRACK_RECENT, 0, reinterpret_cast<LPARAM>(pId))) {
+              delete pId;
+            }
+          }
+          CoUninitialize();
+        }).detach();
         return;
       }
       case ActionKind::OpenLocation:
@@ -5563,14 +5722,55 @@ class LeanCastApp {
   }
 
   bool LaunchApp(const AppEntry& app, bool asAdmin) {
+    // TEMP DEBUG
+    DebugLaunchLog(L"LaunchApp name='" + app.name + L"' type=" +
+                   std::to_wstring(static_cast<int>(app.launchType)) + L" target='" +
+                   app.launchTarget + L"' targetPath='" + app.targetPath + L"' admin=" +
+                   (asAdmin ? L"1" : L"0"));
+
     if (app.launchType == LaunchType::Shell) {
       HINSTANCE result = ShellExecuteW(nullptr, L"open", app.launchTarget.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      DebugLaunchLog(L"  Shell result=" + std::to_wstring(reinterpret_cast<intptr_t>(result)));  // TEMP DEBUG
       return reinterpret_cast<intptr_t>(result) > 32;
     }
 
     if (app.launchType == LaunchType::AppsFolder) {
-      const std::wstring args = L"shell:AppsFolder\\" + app.launchTarget;
-      HINSTANCE result = ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+      // Elevated launches need a real executable; use the execution alias when
+      // we captured one during discovery.
+      if (asAdmin && !app.targetPath.empty()) {
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOASYNC;
+        sei.lpVerb = L"runas";
+        sei.lpFile = app.targetPath.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        if (ShellExecuteExW(&sei)) return true;
+      }
+
+      // Prefer the activation manager: it launches packaged apps (Terminal,
+      // Store apps) by AUMID and brings the window to the foreground. Passing
+      // the AUMID to explorer.exe occasionally just opens the Applications
+      // folder, which is the behavior we want to avoid.
+      ComPtr<IApplicationActivationManager> activator;
+      HRESULT hrCreate = CoCreateInstance(CLSID_ApplicationActivationManager, nullptr,
+                                          CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&activator));
+      DebugLaunchLog(L"  AppsFolder CoCreate hr=0x" + ToHex(static_cast<unsigned>(hrCreate)));  // TEMP DEBUG
+      if (SUCCEEDED(hrCreate)) {
+        DWORD pid = 0;
+        HRESULT hrAct = activator->ActivateApplication(app.launchTarget.c_str(), nullptr, AO_NONE, &pid);
+        DebugLaunchLog(L"  ActivateApplication hr=0x" + ToHex(static_cast<unsigned>(hrAct)) +
+                       L" pid=" + std::to_wstring(pid));  // TEMP DEBUG
+        if (SUCCEEDED(hrAct)) {
+          return true;
+        }
+      }
+
+      // Fallback for classic Start-menu AUMIDs the activation manager can't
+      // handle: open the shell item directly rather than via explorer.exe.
+      const std::wstring target = L"shell:AppsFolder\\" + app.launchTarget;
+      HINSTANCE result = ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      DebugLaunchLog(L"  fallback ShellExecute target='" + target + L"' result=" +
+                     std::to_wstring(reinterpret_cast<intptr_t>(result)));  // TEMP DEBUG
       return reinterpret_cast<intptr_t>(result) > 32;
     }
 
@@ -5595,7 +5795,11 @@ class LeanCastApp {
     sei.lpParameters = args.empty() ? nullptr : args.c_str();
     sei.lpDirectory = cwd.empty() ? nullptr : cwd.c_str();
     sei.nShow = SW_SHOWNORMAL;
-    return ShellExecuteExW(&sei) == TRUE;
+    BOOL ok = ShellExecuteExW(&sei);
+    DebugLaunchLog(L"  Shortcut/Exe file='" + file + L"' ok=" + std::to_wstring(ok) +
+                   L" err=" + std::to_wstring(GetLastError()) +
+                   L" hInst=" + std::to_wstring(reinterpret_cast<intptr_t>(sei.hInstApp)));  // TEMP DEBUG
+    return ok == TRUE;
   }
 
   void TrackRecent(const std::wstring& id) {
@@ -5664,6 +5868,7 @@ class LeanCastApp {
   bool ignoreMouseUntilMove_ = false;
   POINT mouseAnchor_ = {0, 0};
   int settingsHover_ = -1;
+  float settingsScroll_ = 0.0f;
   std::wstring pendingShortcut_;
   ShortcutRecorder shortcutRecorder_;
   ShortcutRuntime shortcutRuntime_;
@@ -5697,6 +5902,7 @@ class LeanCastApp {
   unsigned long long clipboardSerial_ = 0;
   std::optional<std::wstring> internalClipboardText_;
   CurrencyRates currencyRates_;
+  std::wstring localeCurrency_ = DetectLocaleCurrency();
   std::jthread currencyThread_;
   std::jthread updateThread_;
   std::atomic<bool> updateWorkerRunning_ = false;

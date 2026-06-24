@@ -151,6 +151,33 @@ int main() {
     assert(!TryConvert(L"100 abc to eur", rates));
     // With no rate table, currency codes do not resolve.
     assert(!TryConvert(L"100 usd to eur"));
+
+    // Currency-first amount and "=" connector ("USD 5 = GBP").
+    const auto usdGbp = TryConvert(L"USD 5 = GBP", rates);
+    assert(usdGbp && std::fabs(usdGbp->value - 4.0) < 0.001);
+
+    // A lone currency converts to the supplied locale currency.
+    const auto defaultTarget = TryConvert(L"5 usd", rates, L"EUR");
+    assert(defaultTarget && std::fabs(defaultTarget->value - 2.5) < 0.001);
+
+    // Currency-first lone amount also uses the locale currency.
+    const auto currencyFirstDefault = TryConvert(L"USD 5", rates, L"EUR");
+    assert(currencyFirstDefault && std::fabs(currencyFirstDefault->value - 2.5) < 0.001);
+
+    // Without a locale currency a lone amount is not a conversion.
+    assert(!TryConvert(L"5 usd", rates));
+    // Same source and locale currency is suppressed (no "5 EUR = 5 EUR").
+    assert(!TryConvert(L"5 eur", rates, L"EUR"));
+
+    // Currency symbols expand to their ISO codes ("$5", "EUR5 = $").
+    const auto symbolGbp = TryConvert(L"$5 = \u00A3", rates);
+    assert(symbolGbp && std::fabs(symbolGbp->value - 4.0) < 0.001);
+
+    const auto symbolDefault = TryConvert(L"$5", rates, L"EUR");
+    assert(symbolDefault && std::fabs(symbolDefault->value - 2.5) < 0.001);
+
+    const auto euroSymbol = TryConvert(L"\u20AC5 = $", rates);
+    assert(euroSymbol && std::fabs(euroSymbol->value - 10.0) < 0.001);
   }
 
   {
